@@ -1,0 +1,22 @@
+{
+  "duration": 2.029169797897339,
+  "success": true,
+  "candles_count": 500,
+  "indicators": [
+    "rsi",
+    "macd",
+    "macd_hist",
+    "macd_signal",
+    "sma_50",
+    "sma_200",
+    "stoch_k",
+    "stoch_d",
+    "adx",
+    "dmp",
+    "dmn",
+    "pivot_points",
+    "bb_upper",
+    "bb_middle",
+    "bb_lower"
+  ]
+}

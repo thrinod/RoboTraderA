@@ -1,0 +1,66 @@
+Import 'TradeSync' SUCCESS
+Dir: ['Any', 'Exchange', 'Instrument', 'List', 'Optional', 'OrderComplexity', 'OrderSource', 'OrderType', 'PositionType', 'ProductType', 'RequestHandler', 'ServiceProps', 'SettingsProps', 'TradeHub', 'TransactionType', 'Union', 'Validator', '__builtins__', '__cached__', '__doc__', '__file__', '__loader__', '__name__', '__package__', '__spec__', 'contract_read', 'dataclass', 'datetime', 'enum', 'generate_checksum', 'get_device_id', 'hashlib', 'io', 'json', 'logger', 'logging', 'np', 'os', 'pd', 'platform', 'requests', 'setup', 'setuptools', 'subprocess', 'threading', 'time', 'to_epoch', 'uuid', 'validate_cancel_order', 'validate_chart_history', 'validate_exitBracketOrder', 'validate_get_margin', 'validate_gtt_modify_order', 'validate_gtt_place_order', 'validate_input', 'validate_modify_order', 'validate_place_order', 'validate_posConvertion', 'validate_positionSqrOff', 'validate_singleOrderMargin']
+
+Class: Any
+Dir: ['__class__', '__delattr__', '__dict__', '__dir__', '__doc__', '__eq__', '__format__', '__ge__', '__getattribute__', '__getstate__', '__gt__', '__hash__', '__init__', '__init_subclass__', '__le__', '__lt__', '__module__', '__ne__', '__new__', '__reduce__', '__reduce_ex__', '__repr__', '__setattr__', '__sizeof__', '__str__', '__subclasshook__', '__weakref__']
+  __init__: (self, /, *args, **kwargs)
+
+Class: Exchange
+Dir: ['BCD', 'BCO', 'BFO', 'BSE', 'CDS', 'INDICES', 'MCX', 'NCDEX', 'NCO', 'NFO', 'NSE', '__class__', '__contains__', '__doc__', '__getitem__', '__init_subclass__', '__iter__', '__len__', '__members__', '__module__', '__name__', '__qualname__']
+  __init__: (self, *args, **kwds)
+
+Class: Instrument
+Dir: ['__annotations__', '__class__', '__dataclass_fields__', '__dataclass_params__', '__delattr__', '__dict__', '__dir__', '__doc__', '__eq__', '__format__', '__ge__', '__getattribute__', '__getstate__', '__gt__', '__hash__', '__init__', '__init_subclass__', '__le__', '__lt__', '__match_args__', '__module__', '__ne__', '__new__', '__reduce__', '__reduce_ex__', '__repr__', '__setattr__', '__sizeof__', '__str__', '__subclasshook__', '__weakref__']
+  __init__: (self, exchange: Optional[Any], token: Optional[Any], symbol: Optional[Any], trading_symbol: Optional[Any], expiry: Optional[Any], lot_size: Optional[Any]) -> None
+
+Class: OrderComplexity
+Dir: ['AMO', 'Bracket', 'Cover', 'Regular', '__class__', '__contains__', '__doc__', '__getitem__', '__init_subclass__', '__iter__', '__len__', '__members__', '__module__', '__name__', '__qualname__']
+  __init__: (self, *args, **kwds)
+
+Class: OrderSource
+Dir: ['API', 'MOB', 'WEB', '__class__', '__contains__', '__doc__', '__getitem__', '__init_subclass__', '__iter__', '__len__', '__members__', '__module__', '__name__', '__qualname__']
+  __init__: (self, *args, **kwds)
+
+Class: OrderType
+Dir: ['Limit', 'Market', 'StopLoss', 'StopLossMarket', '__class__', '__contains__', '__doc__', '__getitem__', '__init_subclass__', '__iter__', '__len__', '__members__', '__module__', '__name__', '__qualname__']
+  __init__: (self, *args, **kwds)
+
+Class: PositionType
+Dir: ['__class__', '__contains__', '__doc__', '__getitem__', '__init_subclass__', '__iter__', '__len__', '__members__', '__module__', '__name__', '__qualname__', 'posDAY', 'posIOC', 'posNET']
+  __init__: (self, *args, **kwds)
+
+Class: ProductType
+Dir: ['BNPL', 'CNC', 'Delivery', 'GTT', 'Intraday', 'Longterm', 'MIS', 'MTF', 'Normal', '__class__', '__contains__', '__doc__', '__getitem__', '__init_subclass__', '__iter__', '__len__', '__members__', '__module__', '__name__', '__qualname__']
+  __init__: (self, *args, **kwds)
+
+Class: RequestHandler
+Dir: ['__class__', '__delattr__', '__dict__', '__dir__', '__doc__', '__eq__', '__format__', '__ge__', '__getattribute__', '__getstate__', '__gt__', '__hash__', '__init__', '__init_subclass__', '__le__', '__lt__', '__module__', '__ne__', '__new__', '__reduce__', '__reduce_ex__', '__repr__', '__setattr__', '__sizeof__', '__str__', '__subclasshook__', '__weakref__', '_handle_response', 'request']
+  __init__: (self, session_token: str)
+
+Class: ServiceProps
+Dir: ['API_NAME', 'BASE_URL', 'CONTRACT_BASE_URL', 'EXIT_BRACKET_ORDER', 'GET_CHART_HISTORY', 'GET_FUNDS', 'GET_GTT_ORDER_BOOK', 'GET_HOLDINGS', 'GET_ORDER_BOOK', 'GET_ORDER_HISTORY', 'GET_POSITIONS', 'GET_PROFILE', 'GET_TRADE_BOOK', 'GET_VENDOR_SESSION', 'GTT_ORDER_CANCEL', 'GTT_ORDER_EXECUTE', 'GTT_ORDER_MODIFY', 'ORDER_CANCEL', 'ORDER_EXECUTE', 'ORDER_MODIFY', 'POSITION_CONVERSION', 'POSITION_SQR_OFF', 'SINGLE_ORDER_MARGIN', '__class__', '__delattr__', '__dict__', '__dir__', '__doc__', '__eq__', '__format__', '__ge__', '__getattribute__', '__getstate__', '__gt__', '__hash__', '__init__', '__init_subclass__', '__le__', '__lt__', '__module__', '__ne__', '__new__', '__reduce__', '__reduce_ex__', '__repr__', '__setattr__', '__sizeof__', '__str__', '__subclasshook__', '__weakref__', 'get_full_url']
+  __init__: (self, /, *args, **kwargs)
+
+Class: SettingsProps
+Dir: ['PIP_NAME', 'PIP_VERSION', 'SETUP_APIDOCS', 'SETUP_AUTHOR', 'SETUP_AUTHOR_EMAIL', 'SETUP_DESCRIPTION', 'SETUP_DOWNLOADABLE_URL', 'SETUP_LICENSE', 'SETUP_URL', '__class__', '__delattr__', '__dict__', '__dir__', '__doc__', '__eq__', '__format__', '__ge__', '__getattribute__', '__getstate__', '__gt__', '__hash__', '__init__', '__init_subclass__', '__le__', '__lt__', '__module__', '__ne__', '__new__', '__reduce__', '__reduce_ex__', '__repr__', '__setattr__', '__sizeof__', '__str__', '__subclasshook__', '__weakref__']
+  __init__: (self, /, *args, **kwargs)
+
+Class: TradeHub
+Dir: ['GTT_cancelOrder', 'GTT_modifyOrder', 'GTT_placeOrder', '__class__', '__delattr__', '__dict__', '__dir__', '__doc__', '__eq__', '__format__', '__ge__', '__getattribute__', '__getstate__', '__gt__', '__hash__', '__init__', '__init_subclass__', '__le__', '__lt__', '__module__', '__ne__', '__new__', '__reduce__', '__reduce_ex__', '__repr__', '__setattr__', '__sizeof__', '__str__', '__subclasshook__', '__weakref__', '_errorResponse', '_init_del', '_init_get', '_init_post', '_init_put', '_init_session', '_response', 'cancelOrder', 'exitBracketOrder', 'get_GTT_Orderbook', 'get_contract_master', 'get_funds', 'get_holdings', 'get_instrument', 'get_instrument_for_fno', 'get_orderHistory', 'get_orderbook', 'get_positions', 'get_profile', 'get_session_id', 'get_tradebook', 'modifyOrder', 'placeOrder', 'positionSqrOff', 'sessionAuthorization', 'singleOrderMargin']
+  __init__: (self, user_id: Union[str, int], auth_code: str, secret_key: str, base_url: str = None, session_id: str = None)
+
+Class: TransactionType
+Dir: ['Buy', 'Sell', '__class__', '__contains__', '__doc__', '__getitem__', '__init_subclass__', '__iter__', '__len__', '__members__', '__module__', '__name__', '__qualname__']
+  __init__: (self, *args, **kwds)
+
+Class: Validator
+Dir: ['__class__', '__delattr__', '__dict__', '__dir__', '__doc__', '__eq__', '__format__', '__ge__', '__getattribute__', '__getstate__', '__gt__', '__hash__', '__init__', '__init_subclass__', '__le__', '__lt__', '__module__', '__ne__', '__new__', '__reduce__', '__reduce_ex__', '__repr__', '__setattr__', '__sizeof__', '__str__', '__subclasshook__', '__weakref__', 'is_empty', 'is_none', 'is_notEmpty', 'is_pos_num', 'validate_empty', 'validate_none', 'validate_notEmpty', 'validate_pos_num']
+  __init__: (self, /, *args, **kwargs)
+
+Class: datetime
+Dir: ['__add__', '__class__', '__delattr__', '__dir__', '__doc__', '__eq__', '__format__', '__ge__', '__getattribute__', '__getstate__', '__gt__', '__hash__', '__init__', '__init_subclass__', '__le__', '__lt__', '__ne__', '__new__', '__radd__', '__reduce__', '__reduce_ex__', '__repr__', '__rsub__', '__setattr__', '__sizeof__', '__str__', '__sub__', '__subclasshook__', 'astimezone', 'combine', 'ctime', 'date', 'day', 'dst', 'fold', 'fromisocalendar', 'fromisoformat', 'fromordinal', 'fromtimestamp', 'hour', 'isocalendar', 'isoformat', 'isoweekday', 'max', 'microsecond', 'min', 'minute', 'month', 'now', 'replace', 'resolution', 'second', 'strftime', 'strptime', 'time', 'timestamp', 'timetuple', 'timetz', 'today', 'toordinal', 'tzinfo', 'tzname', 'utcfromtimestamp', 'utcnow', 'utcoffset', 'utctimetuple', 'weekday', 'year']
+  __init__: (self, /, *args, **kwargs)
+
+Class: time
+Dir: ['__class__', '__delattr__', '__dir__', '__doc__', '__eq__', '__format__', '__ge__', '__getattribute__', '__getstate__', '__gt__', '__hash__', '__init__', '__init_subclass__', '__le__', '__lt__', '__ne__', '__new__', '__reduce__', '__reduce_ex__', '__repr__', '__setattr__', '__sizeof__', '__str__', '__subclasshook__', 'dst', 'fold', 'fromisoformat', 'hour', 'isoformat', 'max', 'microsecond', 'min', 'minute', 'replace', 'resolution', 'second', 'strftime', 'tzinfo', 'tzname', 'utcoffset']
+  __init__: (self, /, *args, **kwargs)

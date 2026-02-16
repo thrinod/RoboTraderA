@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+pandas
+pandas-ta
+httpx
+pydantic
+python-multipart
+python-jose[cryptography]
+passlib[bcrypt]
+datetime
+Ant-A3-tradehub-sdk-testing
+alice_blue
