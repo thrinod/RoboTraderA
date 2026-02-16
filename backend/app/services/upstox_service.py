@@ -412,9 +412,9 @@ class UpstoxService:
 
         indicators = {
             'rsi': last_row['rsi'] if not pd.isna(last_row['rsi']) else 0,
-            'macd': macd['MACD_12_26_9'].iloc[-1] if not pd.isna(macd['MACD_12_26_9'].iloc[-1]) else 0,
-            'macd_hist': macd['MACDh_12_26_9'].iloc[-1] if not pd.isna(macd['MACDh_12_26_9'].iloc[-1]) else 0,
-            'macd_signal': macd['MACDs_12_26_9'].iloc[-1] if not pd.isna(macd['MACDs_12_26_9'].iloc[-1]) else 0,
+            'macd': get_val_named(macd, 'MACD_12_26_9'),
+            'macd_hist': get_val_named(macd, 'MACDh_12_26_9'),
+            'macd_signal': get_val_named(macd, 'MACDs_12_26_9'),
             'sma_50': last_row['sma_50'] if not pd.isna(last_row['sma_50']) else 0,
             'sma_200': last_row['sma_200'] if not pd.isna(last_row['sma_200']) else 0,
             'stoch_k': get_val_idx(stoch_rsi, 0),
@@ -442,7 +442,7 @@ class UpstoxService:
 
             if interval == "day":
                 fetch_interval = "day"
-                days_back = 30 # User requested 30 days
+                days_back = 400 # Increased for SMA 200
                 resample_rule = None
             elif interval == "1minute":
                 fetch_interval = "1minute"
@@ -544,67 +544,61 @@ class UpstoxService:
         Helper to fetch daily data for pivot calculation.
         """
         try:
-            import datetime
-            from urllib.parse import quote
+            # Re-use the robust historical fetch method
+            # Fetch 10 days to be safe
+            df_d = await self._fetch_historical_df(instrument_key, "day", 10)
             
-            # Calculate dates for Daily Fetch (Last 5 days)
-            today_date = datetime.date.today()
-            p_end = today_date + datetime.timedelta(days=1)
-            p_start = today_date - datetime.timedelta(days=5)
-            p_url = f"https://api.upstox.com/v3/historical-candle/{quote(instrument_key)}/day/{p_end.strftime('%Y-%m-%d')}/{p_start.strftime('%Y-%m-%d')}"
+            if df_d is not None and not df_d.empty:
+                # _fetch_historical_df already sorts by date
+                
+                # We need at least 1 closed candle before today.
+                import datetime
+                import pandas as pd # Import pandas here as it's used for pd.Timestamp
+                today_ts = pd.Timestamp(datetime.date.today())
+                
+                # Ensure timezone-naive for comparison if not already
+                # The _fetch_historical_df returns tz-naive if it's not 'day' interval,
+                # but for 'day' interval, it might be tz-naive.
+                # Let's ensure the timestamp column is available for comparison.
+                # If df_d is indexed by timestamp, we need to access the index for comparison.
+                # If df_d has a 'timestamp' column, we use that.
+                # Assuming _fetch_historical_df returns a DataFrame with 'timestamp' as index.
+                
+                # Convert index to datetime if it's not already, and localize if needed for comparison
+                if df_d.index.tz is not None:
+                    df_d.index = df_d.index.tz_localize(None)
+                
+                closed_days = df_d[df_d.index < today_ts]
+                
+                if len(closed_days) > 0:
+                    yesterday = closed_days.iloc[-1]
+                    yp_high = float(yesterday['high'])
+                    yp_low = float(yesterday['low'])
+                    yp_close = float(yesterday['close'])
+                    
+                    pivot = (yp_high + yp_low + yp_close) / 3
+                    r1 = (2 * pivot) - yp_low
+                    s1 = (2 * pivot) - yp_high
+                    r2 = pivot + (yp_high - yp_low)
+                    s2 = pivot - (yp_high - yp_low)
+                    r3 = yp_high + 2 * (pivot - yp_low)
+                    s3 = yp_low - 2 * (yp_high - pivot)
+                    
+                    pivots = {
+                        'pivot': round(pivot, 2),
+                        'r1': round(r1, 2),
+                        's1': round(s1, 2),
+                        'r2': round(r2, 2),
+                        's2': round(s2, 2),
+                        'r3': round(r3, 2),
+                        's3': round(s3, 2)
+                    }
+                    return pivots
             
-            # Fetch daily data
-            async with httpx.AsyncClient(timeout=10.0) as p_client:
-                p_headers = {"accept": "application/json"}
-                if self.access_token: p_headers["Authorization"] = f"Bearer {self.access_token}"
-                
-                p_resp = await p_client.get(p_url, headers=p_headers)
-                p_json = p_resp.json()
-                
-                if p_json and p_json.get('status') == 'success' and p_json.get('data', {}).get('candles'):
-                    daily_candles = p_json['data']['candles']
-                    df_d = pd.DataFrame(daily_candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'oi'])
-                    
-                    # Sort by date
-                    df_d['timestamp'] = pd.to_datetime(df_d['timestamp'])
-                    if df_d['timestamp'].dt.tz is not None:
-                        df_d['timestamp'] = df_d['timestamp'].dt.tz_localize(None)
-                    
-                    df_d.sort_values('timestamp', inplace=True)
-                    
-                    # We need at least 1 closed candle before today.
-                    today_ts = pd.Timestamp(datetime.date.today())
-                    
-                    closed_days = df_d[df_d['timestamp'] < today_ts]
-                    
-                    if len(closed_days) > 0:
-                        yesterday = closed_days.iloc[-1]
-                        yp_high = float(yesterday['high'])
-                        yp_low = float(yesterday['low'])
-                        yp_close = float(yesterday['close'])
-                        
-                        pivot = (yp_high + yp_low + yp_close) / 3
-                        r1 = (2 * pivot) - yp_low
-                        s1 = (2 * pivot) - yp_high
-                        r2 = pivot + (yp_high - yp_low)
-                        s2 = pivot - (yp_high - yp_low)
-                        r3 = yp_high + 2 * (pivot - yp_low)
-                        s3 = yp_low - 2 * (yp_high - pivot)
-                        
-                        pivots = {
-                            'pivot': round(pivot, 2),
-                            'r1': round(r1, 2),
-                            's1': round(s1, 2),
-                            'r2': round(r2, 2),
-                            's2': round(s2, 2),
-                            'r3': round(r3, 2),
-                            's3': round(s3, 2)
-                        }
-                        
-                        return pivots
             return None
+
         except Exception as e:
-            print(f"Pivot Async Fetch Error for {instrument_key}: {e}")
+            print(f"Pivot Fetch Error: {e}")
             return None
 
     async def _fetch_intraday_data_raw(self, instrument_key: str, interval: str):
