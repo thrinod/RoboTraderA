@@ -831,6 +831,47 @@ class UpstoxService:
                 print(f"Market Quote fetch failed for {instrument_key}: {e}")
                 if prev_close > 0:
                     real_change = real_ltp - prev_close
+            # 5c. Multi-Day Change Calculation
+            daily_changes = []  # [{day: "D-1", pct: 1.23, close: 1234.5}, ...]
+            change_7d = None
+            change_30d = None
+            close_7d = None
+            close_30d = None
+            try:
+                daily_df = await self._fetch_historical_df(instrument_key, "day", days_back_override=45)
+                if daily_df is not None and not daily_df.empty:
+                    daily_closes = daily_df['close'].dropna()
+                    n = len(daily_closes)
+                    ref_price = real_ltp if real_ltp > 0 else (float(daily_closes.iloc[-1]) if n > 0 else 0)
+
+                    # Per-day changes: Day -1 through Day -5
+                    for i in range(1, 6):
+                        if n >= i + 1:
+                            if i == 1:
+                                today_price = ref_price
+                            else:
+                                today_price = float(daily_closes.iloc[-i])
+                            prev_price = float(daily_closes.iloc[-(i + 1)])
+                            if prev_price > 0:
+                                pct = round(((today_price - prev_price) / prev_price) * 100, 2)
+                            else:
+                                pct = None
+                            daily_changes.append({"day": f"D-{i}", "pct": pct, "close": round(today_price, 2)})
+                        else:
+                            daily_changes.append({"day": f"D-{i}", "pct": None, "close": None})
+
+                    # 7D and 30D cumulative
+                    if n >= 8:
+                        close_7d = round(float(daily_closes.iloc[-8]), 2)
+                        if close_7d > 0:
+                            change_7d = round(((ref_price - close_7d) / close_7d) * 100, 2)
+
+                    if n >= 23:
+                        close_30d = round(float(daily_closes.iloc[-23]), 2)
+                        if close_30d > 0:
+                            change_30d = round(((ref_price - close_30d) / close_30d) * 100, 2)
+            except Exception as e:
+                print(f"Multi-day change calc error for {instrument_key}: {e}")
 
             result = {
                 "instrument_key": instrument_key,
@@ -840,6 +881,11 @@ class UpstoxService:
                 "ltp": real_ltp,
                 "change": round(real_change, 2),
                 "prev_close": prev_close,
+                "daily_changes": daily_changes,
+                "change_7d": change_7d,
+                "change_30d": change_30d,
+                "close_7d": close_7d,
+                "close_30d": close_30d,
                 "updated_at": datetime.datetime.now().isoformat()
             }
             
