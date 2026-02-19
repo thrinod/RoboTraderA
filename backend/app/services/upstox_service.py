@@ -114,15 +114,14 @@ class UpstoxService:
                 
                 if response.status_code != 200:
                     print(f"Option Contract API Error: {response.text}")
-                    return ["2025-12-28", "2026-01-04", "2026-01-11"]
+                    return []
                 
                 t2 = time.time()
                 data = response.json()
                 t3 = time.time()
-                print(f"Expiry JSON Parse Time: {t3 - t2:.2f}s")
+                # print(f"Expiry JSON Parse Time: {t3 - t2:.2f}s")
                 
                 if 'data' in data:
-                    raw_len = len(data['data'])
                     # Extract unique expiry dates
                     expiries = set()
                     for contract in data['data']:
@@ -131,7 +130,7 @@ class UpstoxService:
                     
                     sorted_exp = sorted(list(expiries))
                     t4 = time.time()
-                    print(f"Expiry Extraction Time: {t4 - t3:.2f}s | Raw Contracts: {raw_len} | Unique Expiries: {len(sorted_exp)}")
+                    print(f"Fetched {len(sorted_exp)} expiries for {instrument_key}")
                     
                     # 2. Set Cache
                     self.expiry_cache[instrument_key] = {
@@ -142,7 +141,7 @@ class UpstoxService:
                 return []
         except Exception as e:
             print(f"Error fetching expiries: {e}")
-            return ["2025-12-28"] # Demo fallback
+            return []
 
     async def get_spot_price(self, instrument_key: str):
         """
@@ -311,6 +310,7 @@ class UpstoxService:
             
             # 2. MACD
             macd = ta.macd(df['close'], fast=12, slow=26, signal=9)
+            # print(f"DEBUG MACD COLS: {macd.columns.tolist() if macd is not None else 'None'}")
             
             # 3. SMA
             df['sma_50'] = ta.sma(df['close'], length=50)
@@ -439,48 +439,51 @@ class UpstoxService:
             fetch_interval = "1minute" # Default
             resample_rule = None
             days_back = 5
+            use_v3 = False  # Use v3 API for native minute intervals
 
             if interval == "day":
                 fetch_interval = "day"
-                days_back = 400 # Increased for SMA 200
+                days_back = 600 # Increased to 600 to ensure >300 trading days for SMA 200
                 resample_rule = None
             elif interval == "1minute":
                 fetch_interval = "1minute"
-                days_back = 30 # Reverted to 30 as per user request (removed optimization)
+                days_back = 30
                 resample_rule = None
             elif interval == "3minute":
-                fetch_interval = "1minute"
-                days_back = 30 # Reverted
-                resample_rule = "3T"
+                fetch_interval = "minutes/3"
+                days_back = 30  # v3 API has date range limits; 30d gives ~3300 candles
+                resample_rule = None
+                use_v3 = True
             elif interval == "5minute":
-                fetch_interval = "1minute"
-                days_back = 30 # Reverted
-                resample_rule = "5T"
+                fetch_interval = "minutes/5"
+                days_back = 30  # 30d gives ~1650 candles
+                resample_rule = None
+                use_v3 = True
             elif interval == "15minute":
-                fetch_interval = "1minute"
-                 # Optimization: specific 15min api? No, stick to 1min resampling for consistency
-                days_back = 45 # Enough for resampling
-                resample_rule = "15T"
+                fetch_interval = "minutes/15"
+                days_back = 30  # 30d gives ~550 candles, enough for SMA 200
+                resample_rule = None
+                use_v3 = True
             elif interval == "30minute":
                 fetch_interval = "30minute"
                 days_back = 60
                 resample_rule = None
             elif interval == "60minute":
-                # 60min is not native, use 30min for efficiency
-                fetch_interval = "30minute" 
-                days_back = 60 # Need ~70 days for 200 SMA (approx 300 hours), giving buffer
-                resample_rule = "60T"
+                fetch_interval = "minutes/60"
+                days_back = 30  # v3 API date range limit; ~165 candles
+                resample_rule = None
+                use_v3 = True
             else:
                 # Fallback
                 fetch_interval = interval
-                days_back = 30 # Default reverted
+                days_back = 30
                 resample_rule = None 
             
             if days_back_override:
                 days_back = days_back_override
 
             # Fetch Direct from API
-            import datetime
+            # import datetime  <-- Removed local import
             from urllib.parse import quote
             import pandas as pd
             import httpx
@@ -496,6 +499,8 @@ class UpstoxService:
             encoded_key = quote(instrument_key)
             if interval == "day":
                  url = f"{self.base_url}/historical-candle/{encoded_key}/day/{to_date_str}/{from_date_str}"
+            elif use_v3:
+                 url = f"https://api.upstox.com/v3/historical-candle/{encoded_key}/{fetch_interval}/{to_date_str}/{from_date_str}"
             else:
                  url = f"{self.base_url}/historical-candle/{encoded_key}/{fetch_interval}/{to_date_str}/{from_date_str}"
             
@@ -505,7 +510,7 @@ class UpstoxService:
                  headers["Authorization"] = f"Bearer {self.access_token}"
             
             data = None
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with httpx.AsyncClient(timeout=30.0) as client:
                 resp = await client.get(url, headers=headers)
                 data = resp.json()
             
@@ -513,6 +518,10 @@ class UpstoxService:
                 candles = data['data']['candles']
                 df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'oi'])
                 df['timestamp'] = pd.to_datetime(df['timestamp'])
+                # Ensure Naive
+                if df['timestamp'].dt.tz is not None:
+                     df['timestamp'] = df['timestamp'].dt.tz_localize(None)
+
                 df.set_index('timestamp', inplace=True)
                 df.sort_index(inplace=True)
                 
@@ -534,9 +543,12 @@ class UpstoxService:
                 
                 return df
             else:
+                 print(f"History API returned no data for {instrument_key} (status={resp.status_code}, api_status={data.get('status') if data else 'None'})")
                  return pd.DataFrame() # Empty
         except Exception as e:
             print(f"Fetch History Error for {instrument_key}: {e}")
+            import traceback
+            traceback.print_exc()
             return pd.DataFrame()
 
     async def _fetch_daily_pivot_data_async(self, instrument_key: str):
@@ -591,7 +603,8 @@ class UpstoxService:
                         'r2': round(r2, 2),
                         's2': round(s2, 2),
                         'r3': round(r3, 2),
-                        's3': round(s3, 2)
+                        's3': round(s3, 2),
+                        'prev_close': round(yp_close, 2)
                     }
                     return pivots
             
@@ -599,6 +612,255 @@ class UpstoxService:
 
         except Exception as e:
             print(f"Pivot Fetch Error: {e}")
+            return None
+
+    async def get_incremental_candles(self, instrument_key: str, interval: str, db):
+        try:
+            # 1. Load from DB
+            existing_doc = await db["instrument_candles"].find_one({"instrument_key": instrument_key, "interval": interval})
+            
+            existing_df = pd.DataFrame()
+            last_timestamp = None
+            
+            if existing_doc and "candles" in existing_doc:
+                existing_df = pd.DataFrame(existing_doc["candles"])
+                if not existing_df.empty:
+                    # Enforce Numeric Types
+                    cols = ['open', 'high', 'low', 'close', 'volume']
+                    for col in cols:
+                        if col in existing_df.columns:
+                            existing_df[col] = pd.to_numeric(existing_df[col])
+
+                    # Check if timestamp column exists
+                    if 'timestamp' in existing_df.columns:
+                        existing_df['timestamp'] = pd.to_datetime(existing_df['timestamp'])
+                        # Ensure Naive
+                        if existing_df['timestamp'].dt.tz is not None:
+                             existing_df['timestamp'] = existing_df['timestamp'].dt.tz_localize(None)
+                        
+                        existing_df.set_index('timestamp', inplace=True)
+                        existing_df.sort_index(inplace=True)
+                        last_timestamp = existing_df.index[-1]
+            
+            # Check Minimum History Requirement (e.g. for SMA 200)
+            # If we have too few candles, force a full re-fetch to ensure we have enough lookback
+            # Increased to 300 to ensure we have a valid buffer for SMA 200 calculation
+            if len(existing_df) < 300:
+                print(f"Insufficient history ({len(existing_df)} < 300) for {instrument_key}. Forcing full fetch.")
+                last_timestamp = None
+                existing_df = pd.DataFrame() # Discard and re-fetch full
+            
+            # 2. Fetch New Data
+            new_df = pd.DataFrame()
+            
+            if last_timestamp:
+                # diff calculation might fail if last_timestamp is naive and now is aware (or vice versa)
+                # datetime.datetime.now() is naive local
+                # If last_timestamp is naive (as we forced above), this is safe.
+                days_diff = (datetime.datetime.now() - last_timestamp).days
+                if days_diff >= 0:
+                     # Fetch recent history overlap to ensure no gaps
+                     # print(f"Fetching updates for {instrument_key} since {last_timestamp}")
+                     new_df = await self._fetch_historical_df(instrument_key, interval, days_back_override=max(days_diff + 5, 5))
+            else:
+                # Full Fetch
+                # print(f"Full fetch for {instrument_key}")
+                # Remove override to let _fetch_historical_df use its defaults (which is 600 for 'day')
+                new_df = await self._fetch_historical_df(instrument_key, interval)
+            
+            # 3. Merge
+            final_df = existing_df
+            
+            if new_df is not None and not new_df.empty:
+                # Ensure new_df is also naive
+                if new_df.index.tz is not None:
+                     new_df.index = new_df.index.tz_localize(None)
+
+                if existing_df.empty:
+                    final_df = new_df
+                else:
+                    # Combine
+                    combined = pd.concat([existing_df, new_df])
+                    # Remove duplicates keeping last
+                    combined = combined[~combined.index.duplicated(keep='last')]
+                    combined.sort_index(inplace=True)
+                    final_df = combined
+            
+            # 4. Persist
+            if final_df is not None and not final_df.empty:
+                save_df = final_df.reset_index()
+                records = save_df.to_dict(orient='records')
+                
+                await db["instrument_candles"].update_one(
+                    {"instrument_key": instrument_key, "interval": interval},
+                    {"$set": {
+                        "instrument_key": instrument_key,
+                        "interval": interval,
+                        "last_updated": datetime.datetime.now(),
+                        "candles": records
+                    }},
+                    upsert=True
+                )
+            
+            return final_df
+
+        except Exception as e:
+            print(f"Incremental Fetch Error {instrument_key}: {e}")
+            return None
+
+    async def save_candles(self, db, instrument_key, interval, df):
+        try:
+             if df is not None and not df.empty:
+                # records = df.reset_index().to_dict(orient='records')
+                # Check index
+                save_df = df.reset_index()
+                # If timestamp is not in columns after reset (because it wasn't index), handle it
+                if 'timestamp' not in save_df.columns and 'index' in save_df.columns:
+                    save_df.rename(columns={'index': 'timestamp'}, inplace=True)
+                
+                records = save_df.to_dict(orient='records')
+                
+                await db["instrument_candles"].update_one(
+                    {"instrument_key": instrument_key, "interval": interval},
+                    {"$set": {
+                        "instrument_key": instrument_key,
+                        "interval": interval,
+                        "last_updated": datetime.datetime.now(),
+                        "candles": records
+                    }},
+                    upsert=True
+                )
+        except Exception as e:
+            print(f"Error saving candles: {e}")
+
+    async def process_instrument_full(self, instrument_key: str, interval: str, db, mode: str = "combined"):
+        """
+        Full orchestration: Incremental History + Intraday + Calc + Persist
+        Mode: 'combined', 'history', 'intraday'
+        """
+        try:
+            full_df = pd.DataFrame()
+            
+            # 1. History - ALWAYS fetch for SMA 50/200 lookback regardless of mode
+            history_df = await self.get_incremental_candles(instrument_key, interval, db)
+            if history_df is not None and not history_df.empty:
+                # Ensure naive
+                if history_df.index.tz is not None:
+                     history_df.index = history_df.index.tz_localize(None)
+                full_df = history_df
+            
+            # 2. Intraday - fetch when mode is combined or intraday
+            if mode in ["combined", "intraday"]:
+                df_intra = await self._fetch_intraday_data_raw(instrument_key, interval)
+                
+                if df_intra is not None and not df_intra.empty:
+                     # Format Intraday logic from previous implementation
+                    cols = ['open', 'high', 'low', 'close', 'volume']
+                    for col in cols:
+                        if col in df_intra.columns:
+                            df_intra[col] = pd.to_numeric(df_intra[col])
+                    
+                    if 'timestamp' in df_intra.columns:
+                        df_intra['timestamp'] = pd.to_datetime(df_intra['timestamp'])
+                        # TZ handling - simplify to naive for consistency with history
+                        if df_intra['timestamp'].dt.tz is not None:
+                             df_intra['timestamp'] = df_intra['timestamp'].dt.tz_localize(None)
+                        
+                        df_intra.set_index('timestamp', inplace=True)
+                    
+                    # Always merge with history (if available) for SMA lookback
+                    if full_df.empty:
+                         full_df = df_intra
+                    else:
+                         # Concatenate and Dedup
+                         full_df = pd.concat([full_df, df_intra])
+                         full_df = full_df[~full_df.index.duplicated(keep='last')]
+                         full_df.sort_index(inplace=True)
+
+            if full_df.empty:
+                print(f"WARNING: No data for {instrument_key} (mode={mode}, interval={interval})")
+                return None
+
+            # 3. Persist (Save what we have, useful for cache)
+            await self.save_candles(db, instrument_key, interval, full_df)
+
+            # 4. Fetch Pivots (Required for indicators)
+            pivots = await self._fetch_daily_pivot_data_async(instrument_key)
+
+            # 5. Calculate Indicators
+            limit_candles = 500
+            indicators, series, pivot_data = await self.calculate_indicators(full_df, instrument_key=instrument_key, limit=limit_candles, pivot_data=pivots)
+            
+            # DEBUG
+            # print(f"DEBUG {instrument_key} Indicators: {indicators.keys()}")
+            
+            display_df = full_df.tail(limit_candles)
+            
+            # 6. Format Result
+            def clean_for_json(obj):
+                import math
+                if isinstance(obj, float):
+                    if math.isnan(obj) or math.isinf(obj): return None
+                    return obj
+                elif isinstance(obj, dict):
+                    return {k: clean_for_json(v) for k, v in obj.items()}
+                elif isinstance(obj, list):
+                    return [clean_for_json(i) for i in obj]
+                return obj
+
+            # 5b. Get Real-Time Market Quote for accurate LTP and Change
+            real_ltp = float(display_df.iloc[-1]["close"])  # fallback to last candle close
+            prev_close = float(pivots.get('prev_close', 0)) if pivots else 0
+            real_change = 0.0
+
+            try:
+                quotes = self.get_market_quotes([instrument_key])
+                if quotes and instrument_key in quotes:
+                    q = quotes[instrument_key]
+                    if q.get("ltp", 0) > 0:
+                        real_ltp = float(q["ltp"])
+                    if q.get("change") is not None:
+                        real_change = float(q["change"])
+                    elif prev_close > 0:
+                        real_change = real_ltp - prev_close
+                else:
+                    # Quote API returned but key not found, use pivot-based calc
+                    if prev_close > 0:
+                        real_change = real_ltp - prev_close
+            except Exception as e:
+                print(f"Market Quote fetch failed for {instrument_key}: {e}")
+                if prev_close > 0:
+                    real_change = real_ltp - prev_close
+
+            result = {
+                "instrument_key": instrument_key,
+                "candles": display_df.reset_index().assign(timestamp=lambda x: x['timestamp'].dt.strftime('%Y-%m-%dT%H:%M:%S+05:30')).to_dict(orient="records"),
+                "indicators": indicators,
+                "indicators_series": series,
+                "ltp": real_ltp,
+                "change": round(real_change, 2),
+                "prev_close": prev_close,
+                "updated_at": datetime.datetime.now().isoformat()
+            }
+            
+            # --- PERSISTENCE FOR UI LOAD ---
+            # Save the result to a separate collection so we can load it instantly on startup
+            try:
+                await db["scanner_latest_results"].update_one(
+                    {"instrument_key": instrument_key},
+                    {"$set": result},
+                    upsert=True
+                )
+            except Exception as e:
+                print(f"Error persisting scanner result: {e}")
+            # -------------------------------
+
+            return clean_for_json(result)
+
+        except Exception as e:
+            print(f"Process Instrument Error {instrument_key}: {e}")
+            import traceback
+            traceback.print_exc()
             return None
 
     async def _fetch_intraday_data_raw(self, instrument_key: str, interval: str):
@@ -626,7 +888,7 @@ class UpstoxService:
                  headers["Authorization"] = f"Bearer {self.access_token}"
             
             intraday_df = pd.DataFrame()
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with httpx.AsyncClient(timeout=30.0) as client:
                 response = await client.get(url, headers=headers)
                 if response.status_code == 200:
                      data = response.json()
@@ -644,6 +906,10 @@ class UpstoxService:
                                  "oi": c[6]
                              })
                          intraday_df = pd.DataFrame(formatted)
+                     else:
+                         print(f"Intraday API non-success for {instrument_key}: {data.get('status')}")
+                else:
+                    print(f"Intraday API HTTP {response.status_code} for {instrument_key}")
             return intraday_df
         except Exception as e:
             print(f"Intraday Direct Fetch Error for {instrument_key}: {e}")
@@ -1008,17 +1274,31 @@ class UpstoxService:
     async def load_token(self, db):
         """
         Loads the access token from MongoDB on startup.
+        Fallbacks to UPSTOX_ACCESS_TOKEN env var if not in DB.
         """
         try:
             settings_col = db["settings"]
             doc = await settings_col.find_one({"_id": "upstox_config"})
+            
+            token = None
             if doc and "access_token" in doc:
                 token = doc["access_token"]
+                print(f"Token loaded from DB: {token[:5]}...")
+            else:
+                 # Check Env Var
+                 env_token = os.getenv("UPSTOX_ACCESS_TOKEN")
+                 if env_token:
+                     token = env_token
+                     print(f"Token loaded from ENV: {token[:5]}...")
+                 else:
+                     print("Token not found in DB or ENV.")
+            
+            if token:
                 self.access_token = token
                 self.configuration.access_token = token
-                print(f"Token loaded from DB: {token[:5]}...")
+            
         except Exception as e:
-            print(f"Error loading token from DB: {e}")
+            print(f"Error loading token: {e}")
 
     async def save_token(self, db, token: str):
         """

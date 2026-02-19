@@ -2,7 +2,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List
+from typing import List, Optional
 from contextlib import asynccontextmanager
 from motor.motor_asyncio import AsyncIOMotorClient
 import os
@@ -14,6 +14,10 @@ from app.services.trading_engine import trading_engine
 from app.services.mock_trade_service import mock_trade_service
 from app.services.alice_blue_service import alice_blue_service
 from app.services.alice_blue_service import alice_blue_service
+from app.services.scanner_populate import ScannerPopulateService
+
+# Global Service Instances
+scanner_populate = None
 
 load_dotenv()
 
@@ -33,6 +37,10 @@ async def lifespan(app: FastAPI):
         # Pass DB to Services
         trading_engine.set_db(app.mongodb)
         mock_trade_service.set_db(app.mongodb)
+        
+        # Initialize Scanner Populate Service
+        global scanner_populate
+        scanner_populate = ScannerPopulateService(app.mongodb, upstox_service)
         
         # Check if collection is empty and insert dummy data if needed
         count = await app.mongodb["upstox_collection"].count_documents({})
@@ -635,8 +643,9 @@ class ScannerInstrumentItem(BaseModel):
 
 @app.get("/scanner/instruments")
 async def get_scanner_instruments():
-    cursor = app.mongodb["scanner_instruments"].find().sort("_id", -1)
-    docs = await cursor.to_list(length=10000) # Support large list
+    # Switch to 'scanner_instruments_main'
+    cursor = app.mongodb["scanner_instruments_main"].find().sort("name", 1)
+    docs = await cursor.to_list(length=10000) 
     return {"data": [serialize_doc(doc) for doc in docs]}
 
 @app.post("/scanner/instruments")
@@ -667,11 +676,33 @@ async def remove_scanner_instrument(instrument_key: str):
     res = await app.mongodb["scanner_instruments"].delete_one({"instrument_key": instrument_key})
     return {"status": "success", "deleted_count": res.deleted_count}
 
-@app.delete("/scanner/instruments")
-async def clear_scanner_instruments():
-    # Clear all
     await app.mongodb["scanner_instruments"].delete_many({})
     return {"status": "success"}
+
+def sanitize_nan(obj):
+    if isinstance(obj, float):
+        import math
+        if math.isnan(obj) or math.isinf(obj):
+            return 0  # Or None, but frontend handles 0 better for numbers
+    if isinstance(obj, dict):
+        return {k: sanitize_nan(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [sanitize_nan(v) for v in obj]
+    return obj
+
+@app.get("/scanner/results")
+async def get_scanner_results():
+    try:
+        cursor = app.mongodb["scanner_latest_results"].find({})
+        results = await cursor.to_list(length=5000)
+        for r in results:
+            if "_id" in r: del r["_id"]
+        
+        clean_results = sanitize_nan(results)
+        return {"data": clean_results}
+    except Exception as e:
+        print(f"Error fetching results: {e}")
+        return {"data": []}
 
 @app.post("/scanner/populate")
 async def populate_scanner(index: str = "NIFTY 50"):
@@ -679,9 +710,17 @@ async def populate_scanner(index: str = "NIFTY 50"):
     service = ScannerPopulateService(app.mongodb, upstox_service)
     return await service.populate_index(index)
 
+@app.post("/scanner/populate_fno")
+async def populate_scanner_fno():
+    from app.services.scanner_populate import ScannerPopulateService
+    service = ScannerPopulateService(app.mongodb, upstox_service)
+    return await service.populate_from_fno()
+
 class ScannerProcessRequest(BaseModel):
     interval: str = "1minute"
-    instrument_keys: List[str] = [] # Optional: if empty, process all in DB
+    instrument_keys: Optional[List[str]] = None # Optional: if empty, process all in DB
+    mode: str = "combined" # 'combined', 'history', 'intraday'
+    force_refresh: bool = False
 
 @app.post("/scanner/process")
 async def process_scanner_data(req: ScannerProcessRequest):
@@ -697,7 +736,15 @@ async def process_scanner_data(req: ScannerProcessRequest):
     if not keys:
         return {"data": []}
 
-    # 2. Bulk Fetch with Concurrency Control
+    # 2. Force Refresh: Delete existing results if requested
+    if req.force_refresh:
+        # print(f"Force Refresh: Deleting results for {len(keys)} instruments.")
+        try:
+            await app.mongodb["scanner_latest_results"].delete_many({"instrument_key": {"$in": keys}})
+        except Exception as e:
+            print(f"Error during force refresh delete: {e}")
+
+    # 3. Bulk Fetch with Concurrency Control
     # Upstox Rate Limit is usually ~10 requests/sec or so for history? 
     # Actually V2 API history is generous but we should be careful.
     # Let's use a Semaphore.
@@ -735,9 +782,8 @@ async def process_scanner_data(req: ScannerProcessRequest):
     for k in keys:
         try:
              # Direct call, no semaphore needed since it's sequential
-             # But let's keep fetch_safe logic or just move it here.
-             # Moving logic inline for simplicity/clarity of sequential nature.
-             res = await fetch_safe(k)
+             # Use new full orchestration
+             res = await upstox_service.process_instrument_full(k, req.interval, app.mongodb, req.mode)
              results.append(res)
         except Exception as e:
              print(f"Loop Error {k}: {e}")
@@ -748,7 +794,67 @@ async def process_scanner_data(req: ScannerProcessRequest):
     
     # Filter valid results
     valid_data = [r for r in results if r is not None]
+
+    # Log missing/failed instruments
+    successful_keys = {r.get("instrument_key") for r in valid_data if r}
+    failed_keys = [k for k in keys if k not in successful_keys]
+    if failed_keys:
+        print(f"=== SCANNER: FAILED INSTRUMENTS ({len(failed_keys)}/{len(keys)}) ===")
+        for fk in failed_keys:
+            print(f"  FAILED: {fk}")
+        print(f"=== END FAILED INSTRUMENTS ===")
+
+    # 3. Save to Database (Persist Results)
+    if valid_data:
+        from pymongo import UpdateOne
+        import datetime
+        
+        operations = []
+        timestamp = datetime.datetime.now().isoformat()
+        
+        for item in valid_data:
+            key = item.get("instrument_key")
+            if key:
+                # Add timestamp
+                item["updated_at"] = timestamp
+                operations.append(
+                    UpdateOne(
+                        {"instrument_key": key},
+                        {"$set": item},
+                        upsert=True
+                    )
+                )
+        
+        if operations:
+            try:
+                await app.mongodb["scanner_results"].bulk_write(operations)
+                print(f"Saved {len(operations)} records to DB")
+            except Exception as e:
+                print(f"DB Save Error: {e}")
     
-    print(f"Scanner Batch ({len(keys)} items) processed in {end_time - start_time:.2f} seconds. Concurrency: 1 (Sequential)")
+    print(f"Scanner Batch ({len(keys)} items, {len(valid_data)} success, {len(failed_keys)} failed) processed in {end_time - start_time:.2f} seconds.")
     
     return {"data": valid_data}
+@app.post("/scanner/populate_fno")
+async def populate_scanner_fno():
+    """
+    Populates scanner_instruments from the local fno_stocks collection
+    """
+    res = await scanner_populate.populate_from_fno()
+    return res
+
+@app.post("/scanner/fetch-fno")
+async def fetch_fno_from_nse():
+    """
+    Downloads FNO list from NSE website and updates fno_stocks collection
+    """
+    res = await scanner_populate.fetch_fno_list()
+    return res
+
+@app.post("/scanner/fetch-master")
+async def fetch_master_instruments():
+    """
+    Downloads Upstox Master Instrument List (NSE) and populates upstox_collection
+    """
+    res = await scanner_populate.fetch_master_instruments()
+    return res
