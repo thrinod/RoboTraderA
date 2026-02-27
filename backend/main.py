@@ -141,6 +141,7 @@ async def list_collections():
 
 class WatchlistItem(BaseModel):
     instrument_key: str
+    watchlist_id: int = 1 # Support 5 watchlists (1-5)
     added_at: str | None = None
     ltp: float | None = None
     change: float | None = None
@@ -150,8 +151,8 @@ class WatchlistItem(BaseModel):
     low: float | None = None
 
 @app.get("/watchlist")
-async def get_watchlist():
-    cursor = app.mongodb["watchlist"].find().sort("added_at", -1)
+async def get_watchlist(watchlist_id: int = 1):
+    cursor = app.mongodb["watchlist"].find({"watchlist_id": watchlist_id}).sort("added_at", -1)
     docs = await cursor.to_list(length=100)
     return {"data": [serialize_doc(doc) for doc in docs]}
 
@@ -181,12 +182,12 @@ async def get_quotes(req: QuoteRequest):
     return {"data": quotes}
 
 @app.post("/watchlist/refresh")
-async def refresh_watchlist():
+async def refresh_watchlist(watchlist_id: int = 1):
     # Lazy Load Token if missing
     if not upstox_service.access_token:
         await upstox_service.load_token(app.mongodb)
 
-    cursor = app.mongodb["watchlist"].find().sort("added_at", -1)
+    cursor = app.mongodb["watchlist"].find({"watchlist_id": watchlist_id}).sort("added_at", -1)
     docs = await cursor.to_list(length=100)
     
     keys = [doc["instrument_key"] for doc in docs if "instrument_key" in doc]
@@ -263,19 +264,25 @@ async def refresh_watchlist():
 @app.post("/watchlist")
 async def add_to_watchlist(item: WatchlistItem):
     import datetime
-    # Check if exists
-    existing = await app.mongodb["watchlist"].find_one({"instrument_key": item.instrument_key})
+    # Check if exists in this specific watchlist
+    existing = await app.mongodb["watchlist"].find_one({
+        "instrument_key": item.instrument_key,
+        "watchlist_id": item.watchlist_id
+    })
     if existing:
-        return {"message": "Already in watchlist"}
+        return {"status": "error", "message": f"Already in Watchlist {item.watchlist_id}"}
     
     doc = item.dict()
     doc["added_at"] = datetime.datetime.now().isoformat()
     await app.mongodb["watchlist"].insert_one(doc)
-    return {"message": "Added to watchlist"}
+    return {"status": "success", "message": f"Added to Watchlist {item.watchlist_id}"}
 
 @app.delete("/watchlist/{instrument_key}")
-async def remove_from_watchlist(instrument_key: str):
-    res = await app.mongodb["watchlist"].delete_one({"instrument_key": instrument_key})
+async def remove_from_watchlist(instrument_key: str, watchlist_id: int = 1):
+    res = await app.mongodb["watchlist"].delete_one({
+        "instrument_key": instrument_key,
+        "watchlist_id": watchlist_id
+    })
     if res.deleted_count > 0:
         return {"message": "Removed from watchlist"}
     return {"message": "Item not found"}
@@ -302,9 +309,9 @@ async def get_collection_data(collection_name: str, search: str = None, limit: i
     return {"data": [serialize_doc(doc) for doc in docs]}
 
 @app.get("/market/instruments/search")
-async def search_instruments(q: str = "", limit: int = 50, segment: str = None, exchange: str = None, mtf_enabled: bool = False):
+async def search_instruments(q: str = "", limit: int = 50, segment: str = None, exchange: str = None, instrument_type: str = None, mtf_enabled: bool = False):
     # Allow search if query is at least 2 chars OR if any filter is applied
-    has_filters = segment or exchange or mtf_enabled
+    has_filters = segment or exchange or instrument_type or mtf_enabled
     if (not q or len(q) < 2) and not has_filters:
         return {"data": []}
     
@@ -330,15 +337,25 @@ async def search_instruments(q: str = "", limit: int = 50, segment: str = None, 
         query_filters.append({"segment": segment})
     if exchange:
         query_filters.append({"exchange": exchange})
+    if instrument_type:
+        query_filters.append({"instrument_type": instrument_type})
     if mtf_enabled:
         # Assuming field name is mtf_enabled
         query_filters.append({"mtf_enabled": True})
     
-    query = {"$and": query_filters}
+    query = {"$and": query_filters} if query_filters else {}
     
     cursor = app.mongodb["upstox_collection"].find(query).limit(limit)
     docs = await cursor.to_list(length=limit)
     return {"data": [serialize_doc(doc) for doc in docs]}
+
+@app.get("/market/instruments/types")
+async def get_instrument_types():
+    """Returns unique instrument types from upstox_collection"""
+    types = await app.mongodb["upstox_collection"].distinct("instrument_type")
+    # Filter out empty or None
+    valid_types = [t for t in types if t]
+    return {"data": sorted(valid_types)}
 
 class TokenRequest(BaseModel):
     token: str
