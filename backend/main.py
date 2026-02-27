@@ -15,6 +15,7 @@ from app.services.mock_trade_service import mock_trade_service
 from app.services.alice_blue_service import alice_blue_service
 from app.services.alice_blue_service import alice_blue_service
 from app.services.scanner_populate import ScannerPopulateService
+from app.services.charges_service import charges_service
 
 # Global Service Instances
 scanner_populate = None
@@ -453,6 +454,17 @@ def get_holdings():
     if not data:
         return {"data": []}
     return data # get_holdings already wraps in {'data': ...} in service now
+
+@app.get("/user/charges")
+def get_user_charges():
+    """Calculate actual F&O charges for today's completed trades."""
+    try:
+        trades = upstox_service.get_trade_book()
+        result = charges_service.calculate_charges(trades)
+        return {"status": "success", "data": result}
+    except Exception as e:
+        print(f"Error calculating charges: {e}")
+        return {"status": "error", "message": str(e), "data": {"total": {"grand_total": 0, "trade_count": 0, "order_count": 0}, "trades": []}}
 
 @app.get("/market/options/chain")
 async def get_option_chain(instrument_key: str, expiry_date: str):

@@ -13,6 +13,8 @@ import pandas_ta as ta
 import datetime
 from urllib.parse import quote
 import asyncio
+import numpy as np
+import math
 
 
 class UpstoxService:
@@ -249,6 +251,7 @@ class UpstoxService:
                                 'price_change': change,
                                 'bid_price': md.get('bid_price', 0),
                                 'ask_price': md.get('ask_price', 0),
+                                'low_price': md.get('low_price', 0),
                                 'iv': greeks.get('iv', 0),
                                 'delta': delta,
                                 'oi_value': oi_value,
@@ -281,12 +284,23 @@ class UpstoxService:
                                 'price_change': change,
                                 'bid_price': md.get('bid_price', 0),
                                 'ask_price': md.get('ask_price', 0),
+                                'low_price': md.get('low_price', 0),
                                 'iv': greeks.get('iv', 0),
                                 'delta': delta,
                                 'oi_value': oi_value,
                                 'lot_size': pe.get('lot_size', 0)
                             }
                             flat_data.append(pe_record)
+
+                    # Fetch real low_price/high_price from Quotes API (Option Chain API md lacks them)
+                    all_keys = [r['instrument_key'] for r in flat_data if r.get('instrument_key')]
+                    if all_keys:
+                        quotes = self.get_market_quotes(all_keys)
+                        for r in flat_data:
+                            key = r['instrument_key']
+                            if key in quotes:
+                                r['low_price'] = quotes[key].get('low', 0)
+                                r['high_price'] = quotes[key].get('high', 0)
 
                     return { 'chain': flat_data, 'totals': { 'ce': total_ce_oi, 'pe': total_pe_oi } }
                 return { 'chain': [], 'totals': { 'ce': 0, 'pe': 0 } }
@@ -298,6 +312,101 @@ class UpstoxService:
 
 
 
+
+    async def _detect_box_formation(self, df, live_ltp: float):
+        """
+        Port of the JS box detection logic for the scanner/backend.
+        Identifies consolidation zones from previous days and checks current breakout.
+        """
+        try:
+            if df is None or len(df) < 10:
+                return None
+
+            # Ensure we are using the date for filtering previous days
+            today_date = datetime.date.today()
+            
+            # Filter candles from previous trading days (excluding today)
+            # This follows the same logic as the Indicators page
+            prev_day_df = df[df.index.date < today_date]
+            
+            if len(prev_day_df) < 10:
+                # If we don't have enough history, use a fixed lookback of last 100 candles
+                prev_day_df = df.iloc[:-20] if len(df) > 30 else df
+                if len(prev_day_df) < 10: return None
+
+            highs = prev_day_df['high'].values
+            lows = prev_day_df['low'].values
+            closes = prev_day_df['close'].values
+            opens = prev_day_df['open'].values
+            
+            avg_price = closes.mean()
+            all_prices = np.concatenate([highs, lows, closes])
+            min_price = np.min(all_prices)
+            max_price = np.max(all_prices)
+            price_range = max_price - min_price
+            
+            if price_range <= 0 or avg_price <= 0:
+                return None
+                
+            num_buckets = 20
+            bucket_size = price_range / num_buckets
+            buckets = [0] * num_buckets
+            
+            # price-zone clustering
+            for i in range(len(prev_day_df)):
+                l = lows[i]
+                h = highs[i]
+                low_idx = min(int((l - min_price) // bucket_size), num_buckets - 1)
+                high_idx = min(int((h - min_price) // bucket_size), num_buckets - 1)
+                for b in range(low_idx, high_idx + 1):
+                    buckets[b] += 1
+                    
+            # Sliding window for densest zone
+            best_start, best_end, best_density = 0, num_buckets - 1, 0
+            for width in range(4, 15):
+                for start in range(num_buckets - width + 1):
+                    density = sum(buckets[start:start+width])
+                    if density > best_density:
+                        best_density = density
+                        best_start = start
+                        best_end = start + width - 1
+                        
+            box_low = min_price + best_start * bucket_size
+            box_high = min_price + (best_end + 1) * bucket_size
+            box_width_pct = ((box_high - box_low) / avg_price) * 100
+            
+            # Body containment
+            inside_count = 0
+            for i in range(len(prev_day_df)):
+                body_high = max(opens[i], closes[i])
+                body_low = min(opens[i], closes[i])
+                overlap = min(body_high, box_high) - max(body_low, box_low)
+                body_size = (body_high - body_low) or 0.01
+                if overlap / body_size >= 0.5:
+                    inside_count += 1
+                    
+            containment = (inside_count / len(prev_day_df)) * 100
+            
+            # Breakout logic with live LTP
+            ltp = live_ltp if live_ltp > 0 else closes[-1]
+            breakout = "none"
+            if ltp > box_high * 1.02:
+                breakout = "up"
+            elif ltp < box_low * 0.98:
+                breakout = "down"
+                
+            return {
+                "detected": containment >= 60,
+                "box_high": round(box_high, 2),
+                "box_low": round(box_low, 2),
+                "width": round(box_width_pct, 2),
+                "containment": round(containment, 1),
+                "breakout": breakout,
+                "ltp": ltp
+            }
+        except Exception as e:
+            print(f"Error in _detect_box_formation: {e}")
+            return None
 
     async def calculate_indicators(self, df, instrument_key=None, limit=100, pivot_data=None):
         """
@@ -330,7 +439,10 @@ class UpstoxService:
                     df = pd.concat([df, bb], axis=1)
                     bb_data = bb
             
-            # 7. PIVOT POINTS
+            # 7. Box Formation
+            box_info = await self._detect_box_formation(df, df.iloc[-1]['close'])
+            
+            # 8. PIVOT POINTS
             # Note: pivot_data arg allows passing pre-fetched data to avoid sequential fetches loop
             if pivot_data is None and instrument_key:
                 pivot_data = await self._fetch_daily_pivot_data_async(instrument_key)
@@ -353,7 +465,11 @@ class UpstoxService:
                     }
                  except: pass
 
-            return self._calculate_indicators_sync(df, macd, stoch_rsi, adx_data, bb, pivot_data, limit)
+            indicators, series, pivots = self._calculate_indicators_sync(df, macd, stoch_rsi, adx_data, bb, pivot_data, limit)
+            if box_info:
+                indicators['box_formation'] = box_info
+            
+            return indicators, series, pivots
 
         except Exception as e:
             print(f"Calculation Error: {e}")
@@ -1655,20 +1771,19 @@ class UpstoxService:
             response = api_instance.get_full_market_quote(keys_str, api_version='v2')
             
             if response.status == 'success' and response.data:
-                # DEBUG MISMATCH
-                req_set = set(instrument_keys)
-                res_set = set(response.data.keys())
-                print(f"DEBUG: Requested: {req_set}")
-                print(f"DEBUG: Response:   {res_set}")
-                print(f"DEBUG: Missing:    {req_set - res_set}")
+                # Upstox API might return keys using Trading Symbols even if requested via ISIN.
+                # We need to map them back correctly.
                 
                 results = {}
-                # Debug: Print keys of first item to see structure
-                if response.data.values():
-                    first_val = list(response.data.values())[0]
-                    # print(f"DEBUG: Quote keys: {dir(first_val)}") 
-                    # print(f"DEBUG: Quote content: {first_val}")
-
+                
+                # Create a reverse mapping if needed
+                # However, Upstox SDK response.data keys ARE the keys it matched.
+                # If we requested ISIN and it matched, the key in response.data might be the ISIN-based key OR Symbol-based key.
+                
+                # Debug logging
+                # print(f"DEBUG: Requested keys: {instrument_keys}")
+                # print(f"DEBUG: Response keys: {list(response.data.keys())}")
+                
                 for key, quote in response.data.items():
                     # DEBUG: See what we have
                     # print(f"DEBUG: Quote Fields: {dir(quote)}") 
@@ -1752,5 +1867,40 @@ class UpstoxService:
             error_msg = f"Error fetching market quotes: {e}"
             print(error_msg)
             return {"_debug_error": str(e)}
+
+    def get_trade_book(self):
+        """
+        Fetches today's executed trades from Upstox trade book API.
+        Returns a list of trade dicts with order_id, trading_symbol, 
+        transaction_type, quantity, average_price, etc.
+        """
+        if not self.access_token:
+            print("get_trade_book: No access token")
+            return []
+
+        try:
+            import httpx
+
+            url = f"{self.base_url}/order/trades/get-trades-for-day"
+            headers = {
+                "accept": "application/json",
+                "Authorization": f"Bearer {self.access_token}",
+            }
+
+            with httpx.Client(timeout=15.0) as client:
+                resp = client.get(url, headers=headers)
+
+            if resp.status_code != 200:
+                print(f"Trade Book API Error: {resp.status_code} - {resp.text}")
+                return []
+
+            data = resp.json()
+            trades = data.get("data", [])
+            print(f"Trade Book: fetched {len(trades)} trades for today")
+            return trades if isinstance(trades, list) else []
+
+        except Exception as e:
+            print(f"Error fetching trade book: {e}")
+            return []
 
 upstox_service = UpstoxService()
