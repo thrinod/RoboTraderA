@@ -23,7 +23,7 @@ scanner_populate = None
 load_dotenv()
 
 MONGODB_URL = os.getenv("MONGODB_URL", "mongodb://localhost:27017")
-DB_NAME = "robotrader"
+DB_NAME = os.getenv("MONGODB_DB_NAME", "robotrader")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
