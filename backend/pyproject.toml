@@ -1,2 +1,0 @@
-[tool.uv]
-allow-build = ["upstox-python-sdk"]
