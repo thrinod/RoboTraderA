@@ -159,42 +159,52 @@ class ScannerPopulateService:
             print(f"Found {len(fno_symbols)} FNO Symbols. Matching with Upstox DB...")
 
             # 2. Match with Upstox Collection (NSE_EQ)
-            # Upstox Master List usually has trading_symbol as "RELIANCE-EQ" or "RELIANCE"
-            # We try to match both.
-            
-            # Create a list of potential trading symbols
-            # target_symbols = list(fno_symbols) + [s + "-EQ" for s in fno_symbols]
-            # Actually, let's just fetch ALL NSE_EQ and filter in python to be safe and debuggable.
-            # Fetching 5000 docs is fast.
-            
-            # Match with Upstox Collection
-            # Fetch NSE_EQ and NSE instruments
-            all_eq_cursor = self.db["upstox_collection"].find({"exchange": {"$in": ["NSE_EQ", "NSE"]}})
-            all_eq_docs = await all_eq_cursor.to_list(length=None)
+            # Auto-fetch master instruments if collection is empty
+            eq_count = await self.db["upstox_collection"].count_documents({"exchange": {"$in": ["NSE_EQ", "NSE"]}})
+            if eq_count == 0:
+                print("upstox_collection is empty! Auto-fetching master instruments...")
+                await self.fetch_master_instruments()
+
+            # Fetch all possible NSE Equity instruments
+            # We fetch more fields to help with matching
+            all_eq_cursor = self.db["upstox_collection"].find(
+                {"exchange": {"$in": ["NSE_EQ", "NSE"]}},
+                {"trading_symbol": 1, "instrument_key": 1, "name": 1, "instrument_type": 1, "exchange": 1}
+            )
+            all_eq_docs = await all_eq_cursor.to_list(length=50000)
             
             print(f"Loaded {len(all_eq_docs)} NSE instruments from DB for matching.")
             
+            # Create a lookup map for faster matching
+            # Format: { CLEAN_SYMBOL: DOC }
+            upstox_map = {}
+            for doc in all_eq_docs:
+                ts = doc.get('trading_symbol', '').upper().strip()
+                itype = doc.get('instrument_type', '').upper()
+                
+                # Only interested in Equities for FNO matching
+                if itype not in ['EQ', 'EQUITY']:
+                    continue
+                
+                # Normalize symbol: RELIANCE-EQ -> RELIANCE
+                clean_ts = ts.replace("-EQ", "").strip()
+                
+                # If there are duplicates, prioritize NSE_EQ exchange
+                if clean_ts not in upstox_map or doc.get('exchange') == 'NSE_EQ':
+                    upstox_map[clean_ts] = doc
+
             matches = []
             matched_symbols = set()
             
-            for doc in all_eq_docs:
-                ts = doc.get('trading_symbol', '').upper()
-                name = doc.get('name', '').upper()
-                # Also check instrument_type to be EQ or EQUITY
-                itype = doc.get('instrument_type', '').upper()
-                if itype not in ['EQ', 'EQUITY']:
-                    continue
-
-                # Clean TS: Remove -EQ if present
-                clean_ts = ts.replace("-EQ", "").strip()
-                
-                if clean_ts in fno_symbols:
-                    matches.append(doc)
-                    matched_symbols.add(clean_ts)
+            # Match FNO symbols against our map
+            for sym in fno_symbols:
+                if sym in upstox_map:
+                    matches.append(upstox_map[sym])
+                    matched_symbols.add(sym)
             
             print(f"Matched {len(matches)} instruments out of {len(fno_symbols)} FNO symbols.")
 
-            # Index symbol → Upstox instrument key mapping
+            # Index symbol -> Upstox instrument key mapping
             INDEX_KEY_MAP = {
                 "NIFTY": "NSE_INDEX|Nifty 50",
                 "BANKNIFTY": "NSE_INDEX|Nifty Bank",
@@ -206,12 +216,12 @@ class ScannerPopulateService:
                 "NIFTYIT": "NSE_INDEX|Nifty IT",
             }
 
-            # Check missing symbols — map indices to their instrument keys
-            missing_symbols = sorted(fno_symbols - matched_symbols)
+            # Check missing symbols
+            still_missing = sorted(list(fno_symbols - matched_symbols))
             index_matches = []
-            still_missing = []
+            final_missing = []
 
-            for sym in missing_symbols:
+            for sym in still_missing:
                 if sym in INDEX_KEY_MAP:
                     index_matches.append({
                         "instrument_key": INDEX_KEY_MAP[sym],
@@ -220,30 +230,25 @@ class ScannerPopulateService:
                         "instrument_type": "INDEX"
                     })
                     matched_symbols.add(sym)
-                    print(f"  INDEX MAPPED: {sym} -> {INDEX_KEY_MAP[sym]}")
                 else:
-                    still_missing.append(sym)
+                    final_missing.append(sym)
 
-            if index_matches:
-                print(f"Mapped {len(index_matches)} index symbols to instrument keys.")
-            
             if still_missing:
-                print(f"=== TRULY MISSING FNO INSTRUMENTS ({len(still_missing)}) ===")
-                for sym in still_missing:
+                print(f"=== TRULY MISSING FNO INSTRUMENTS ({len(final_missing)}) ===")
+                for sym in final_missing:
                     print(f"  MISSING FNO: {sym}")
                 print(f"=== END MISSING FNO ===")
             
             if len(matches) == 0 and len(index_matches) == 0:
-                 # Return debug info to frontend
                  return {
                      "status": "warning",
-                     "message": "No matches found",
+                     "message": "No matches found. Check if master instruments are loaded.",
                      "count": 0,
-                     "missing": len(fno_symbols),
                      "debug": {
-                         "db_total_loaded": len(all_eq_docs),
+                         "db_total_nse": len(all_eq_docs),
+                         "upstox_map_size": len(upstox_map),
                          "sample_fno": list(fno_symbols)[:5],
-                         "sample_db_ts": [d.get('trading_symbol') for d in all_eq_docs[:5]]
+                         "sample_upstox": list(upstox_map.keys())[:5]
                      }
                  }
 
@@ -420,6 +425,12 @@ class ScannerPopulateService:
             # Let's clean column names
             df.columns = [c.strip() for c in df.columns]
             
+            # Normalize column names to match our schema
+            # CSV has 'tradingsymbol' but our code expects 'trading_symbol'
+            if 'tradingsymbol' in df.columns and 'trading_symbol' not in df.columns:
+                df.rename(columns={'tradingsymbol': 'trading_symbol'}, inplace=True)
+                print("Renamed column 'tradingsymbol' -> 'trading_symbol'")
+            
             # Filter for NSE_EQ and NSE_FO? 
             # The file is "NSE.csv.gz" so it contains NSE_EQ and NSE_FO usually.
             # We need to ensure we map fields correctly for our schema.
@@ -454,32 +465,20 @@ class ScannerPopulateService:
                 itype = clean_row.get('instrument_type')
                 exchange = clean_row.get('exchange')
                 
-                # Check for Equity types (EQ, EQUITY) or if it's implicitly NSE Equity
-                # Note: 'A' type is usually BSE, ensure we match NSE properly.
-                is_equity = itype in ['EQUITY', 'EQ'] or (exchange in ['NSE', 'NSE_EQ'] and itype != 'FUT' and itype != 'OPT')
+                # Check for Equity types
+                is_equity = itype in ['EQUITY', 'EQ']
                 
                 if is_equity:
-                     clean_row['instrument_type'] = 'EQ' # Normalize
-                     if exchange == 'NSE':
-                         clean_row['exchange'] = 'NSE_EQ'
-                     
-                     # FORCE Token-based key if available (Fix for ISIN keys being rejected)
-                     token = clean_row.get('exchange_token')
-                     if token and clean_row.get('exchange') == 'NSE_EQ':
-                         try:
-                             # Handle potential float/int conversion
-                             t_str = str(int(float(token)))
-                             clean_row['instrument_key'] = f"NSE_EQ|{t_str}"
-                         except:
-                             clean_row['instrument_key'] = f"NSE_EQ|{token}"
-                             
-                         # Debug Log for crucial tickers
-                         if clean_row.get('trading_symbol') in ['KOTAKBANK', 'MCX', 'NUVAMA']:
-                             print(f"DEBUG: Fixed Key for {clean_row['trading_symbol']} -> {clean_row['instrument_key']}")
-                             try:
-                                 with open("ingestion_debug.txt", "a") as f:
-                                     f.write(f"FIXED: {clean_row}\n")
-                             except: pass
+                      clean_row['instrument_type'] = 'EQ' # Normalize
+                      if exchange == 'NSE':
+                          clean_row['exchange'] = 'NSE_EQ'
+                      
+                      # Use the instrument_key exactly as provided in the Upstox CSV
+                      # (which for NSE_EQ is usually ISIN-based, e.g. NSE_EQ|INE...)
+                      
+                      # Debug Log for crucial tickers
+                      if clean_row.get('trading_symbol') in ['KOTAKBANK', 'MCX', 'NUVAMA']:
+                          print(f"DEBUG: Ticker {clean_row['trading_symbol']} -> Key: {clean_row.get('instrument_key')}")
                 
                 if clean_row.get('trading_symbol') in ['KOTAKBANK', 'MCX', 'NUVAMA']:
                      try:
