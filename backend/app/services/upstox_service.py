@@ -34,9 +34,10 @@ class UpstoxService:
 
         
 
-    def verify_token(self, token: str) -> bool:
+    def verify_token(self, token: str) -> tuple[bool, str]:
         """
         Verifies the token by making a dummy call to Upstox API (e.g. User Profile).
+        Returns (is_valid, message)
         """
         self.configuration.access_token = token
         try:
@@ -45,10 +46,20 @@ class UpstoxService:
             user_api = UserApi(api_client)
             response = user_api.get_profile("2.0")
             print(f"Token Verified. User: {response.data.user_name}")
-            return True
+            return True, "Success"
         except Exception as e:
-            print(f"Token Verification Failed: {e}")
-            return False
+            error_msg = str(e)
+            print(f"Token Verification Failed: {error_msg}")
+            # Try to extract more detail if it's a known error structure
+            if hasattr(e, 'body'):
+                try:
+                    import json
+                    body = json.loads(e.body)
+                    if 'errors' in body and len(body['errors']) > 0:
+                        error_msg = body['errors'][0].get('message', error_msg)
+                except:
+                    pass
+            return False, error_msg
 
     def has_valid_token(self) -> bool:
         return self.access_token is not None
@@ -1764,26 +1775,25 @@ class UpstoxService:
             return {}
 
         try:
-            # Join keys by comma
-            keys_str = ",".join(instrument_keys)
             api_instance = MarketQuoteApi(ApiClient(self.configuration))
-            # get_full_market_quote expects instrument_key as comma separated string
-            response = api_instance.get_full_market_quote(keys_str, api_version='v2')
+            results = {}
+            chunk_size = 500
             
-            if response.status == 'success' and response.data:
+            for i in range(0, len(instrument_keys), chunk_size):
+                chunk = instrument_keys[i:i+chunk_size]
+                keys_str = ",".join(chunk)
+                
+                try:
+                    response = api_instance.get_full_market_quote(keys_str, api_version='v2')
+                except Exception as inner_e:
+                    print(f"Error fetching quote chunk: {inner_e}")
+                    continue
+                    
+                if not (response.status == 'success' and response.data):
+                    continue
+                
                 # Upstox API might return keys using Trading Symbols even if requested via ISIN.
                 # We need to map them back correctly.
-                
-                results = {}
-                
-                # Create a reverse mapping if needed
-                # However, Upstox SDK response.data keys ARE the keys it matched.
-                # If we requested ISIN and it matched, the key in response.data might be the ISIN-based key OR Symbol-based key.
-                
-                # Debug logging
-                # print(f"DEBUG: Requested keys: {instrument_keys}")
-                # print(f"DEBUG: Response keys: {list(response.data.keys())}")
-                
                 for key, quote in response.data.items():
                     # DEBUG: See what we have
                     # print(f"DEBUG: Quote Fields: {dir(quote)}") 
@@ -1861,8 +1871,7 @@ class UpstoxService:
                          # Also Index by raw token just in case fallback checks token only
                          results[str(token)] = quote_data
 
-                return results
-            return {}
+            return results
         except Exception as e:
             error_msg = f"Error fetching market quotes: {e}"
             print(error_msg)

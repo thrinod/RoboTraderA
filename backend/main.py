@@ -373,12 +373,12 @@ class BulkOrderRequest(BaseModel):
 
 @app.post("/auth/token")
 async def set_token(request: Request, token_req: TokenRequest):
-    is_valid = upstox_service.verify_token(token_req.token)
+    is_valid, error_msg = upstox_service.verify_token(token_req.token)
     if is_valid:
         await upstox_service.save_token(request.app.mongodb, token_req.token)
-        return {"message": "Token verified and connected", "status": "active", "upstox_status": "Connected"}
+        return {"message": "Token verified and connected", "status": "success", "upstox_status": "Connected"}
     else:
-        return {"message": "Invalid Token", "status": "error", "upstox_status": "Disconnected"}
+        return {"message": f"Invalid Token: {error_msg}", "status": "error", "upstox_status": "Disconnected"}
 
 @app.get("/auth/status")
 async def get_auth_status():
