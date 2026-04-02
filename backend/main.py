@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Header, HTTPException, Depends, status
 from fastapi.responses import RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -91,8 +91,15 @@ async def lifespan(app: FastAPI):
             app.mongodb_client.close()
         print("Disconnected from MongoDB")
 
-app = FastAPI(lifespan=lifespan)
+async def verify_app_token(x_app_token: str = Header(None)):
+    expected_token = os.getenv("APP_PASSWORD", "admin")
+    if expected_token and x_app_token != expected_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid application token"
+        )
 
+app = FastAPI(lifespan=lifespan, dependencies=[Depends(verify_app_token)])
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
