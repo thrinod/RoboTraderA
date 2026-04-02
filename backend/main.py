@@ -360,6 +360,7 @@ async def get_instrument_types():
 
 class TokenRequest(BaseModel):
     token: str
+    algo_name: Optional[str] = None
 
 class OrderItem(BaseModel):
     instrument_key: str
@@ -375,7 +376,7 @@ class BulkOrderRequest(BaseModel):
 async def set_token(request: Request, token_req: TokenRequest):
     is_valid, error_msg = upstox_service.verify_token(token_req.token)
     if is_valid:
-        await upstox_service.save_token(request.app.mongodb, token_req.token)
+        await upstox_service.save_token(request.app.mongodb, token_req.token, token_req.algo_name)
         return {"message": "Token verified and connected", "status": "success", "upstox_status": "Connected"}
     else:
         return {"message": f"Invalid Token: {error_msg}", "status": "error", "upstox_status": "Disconnected"}

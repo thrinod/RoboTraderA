@@ -25,6 +25,7 @@ class UpstoxService:
         self.redirect_uri = os.getenv("UPSTOX_REDIRECT_URI")
         self.base_url = "https://api.upstox.com/v2"
         self.access_token: Optional[str] = None
+        self.algo_name: Optional[str] = None
         
         # Configuration for Upstox Client
         self.configuration = config.Configuration()
@@ -1457,6 +1458,7 @@ class UpstoxService:
             if doc and "access_token" in doc:
                 token = doc["access_token"]
                 print(f"Token loaded from DB: {token[:5]}...")
+                self.algo_name = doc.get("algo_name")
             else:
                  # Check Env Var
                  env_token = os.getenv("UPSTOX_ACCESS_TOKEN")
@@ -1465,6 +1467,10 @@ class UpstoxService:
                      print(f"Token loaded from ENV: {token[:5]}...")
                  else:
                      print("Token not found in DB or ENV.")
+                 
+                 env_algo = os.getenv("UPSTOX_ALGO_NAME")
+                 if env_algo:
+                     self.algo_name = env_algo
             
             if token:
                 self.access_token = token
@@ -1473,17 +1479,18 @@ class UpstoxService:
         except Exception as e:
             print(f"Error loading token: {e}")
 
-    async def save_token(self, db, token: str):
+    async def save_token(self, db, token: str, algo_name: str = None):
         """
         Saves the access token to MongoDB and updates memory.
         """
         self.access_token = token
+        self.algo_name = algo_name
         self.configuration.access_token = token
         try:
             settings_col = db["settings"]
             await settings_col.update_one(
                 {"_id": "upstox_config"},
-                {"$set": {"access_token": token, "updated_at": "now"}},
+                {"$set": {"access_token": token, "algo_name": algo_name, "updated_at": "now"}},
                 upsert=True
             )
             print("Token saved to DB.")
@@ -1526,6 +1533,8 @@ class UpstoxService:
             
         try:
             api_client = ApiClient(self.configuration)
+            if self.algo_name:
+                api_client.set_default_header("X-Algo-Name", self.algo_name)
             order_api = OrderApi(api_client)
             
             req = PlaceOrderRequest(
@@ -1558,6 +1567,8 @@ class UpstoxService:
             
         try:
             api_client = ApiClient(self.configuration)
+            if self.algo_name:
+                api_client.set_default_header("X-Algo-Name", self.algo_name)
             order_api = OrderApi(api_client)
             
             # 1. Fetch Open Orders
