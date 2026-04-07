@@ -20,6 +20,8 @@ from app.services.charges_service import charges_service
 # Global Service Instances
 scanner_populate = None
 
+import mock_npci_payment
+
 load_dotenv()
 
 MONGODB_URL = os.getenv("MONGODB_URL", "mongodb://localhost:27017")
@@ -91,7 +93,10 @@ async def lifespan(app: FastAPI):
             app.mongodb_client.close()
         print("Disconnected from MongoDB")
 
-async def verify_app_token(x_app_token: str = Header(None)):
+async def verify_app_token(request: Request, x_app_token: str = Header(None)):
+    if request.url.path == "/process-payment" or request.url.path.endswith("/process-payment"):
+        return
+        
     expected_token = os.getenv("APP_PASSWORD", "admin")
     if expected_token and x_app_token != expected_token:
         raise HTTPException(
@@ -107,6 +112,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(mock_npci_payment.router)
 
 @app.get("/")
 async def read_root():
