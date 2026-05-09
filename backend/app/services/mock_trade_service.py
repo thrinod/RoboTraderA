@@ -57,6 +57,19 @@ class MockTradeService:
             if '_id' in trade_doc:
                 trade_doc['_id'] = str(trade_doc['_id'])
                 
+            # Telegram Notification
+            try:
+                from .telegram_service import telegram_service
+                msg = (
+                    f"📝 <b>Mock Order Placed</b>\n\n"
+                    f"<b>Instrument:</b> {quote.get('name') or order_details['instrument_key']}\n"
+                    f"<b>Side:</b> {order_details['transaction_type']}\n"
+                    f"<b>Qty:</b> {int(order_details['quantity'])}\n"
+                    f"<b>Price:</b> ₹{avg_price}"
+                )
+                await telegram_service.send_message(msg)
+            except: pass
+
             return {"status": "success", "message": "Mock Order Placed", "data": trade_doc}
         except Exception as e:
             print(f"Mock Trade Exception: {e}")
@@ -157,6 +170,19 @@ class MockTradeService:
                 }
             )
             
+            # Telegram Notification
+            try:
+                from .telegram_service import telegram_service
+                msg = (
+                    f"🎯 <b>Mock Position Closed</b>\n\n"
+                    f"<b>Instrument:</b> {trade['trading_symbol']}\n"
+                    f"<b>Qty:</b> {qty}\n"
+                    f"<b>Exit Price:</b> ₹{exit_price}\n"
+                    f"<b>Final P&L:</b> ₹{round(pnl, 2)}"
+                )
+                await telegram_service.send_message(msg)
+            except: pass
+
             return {"status": "success", "message": f"Exited at {exit_price}, P&L: {round(pnl, 2)}"}
         except Exception as e:
             print(f"Mock Exit Exception: {e}")

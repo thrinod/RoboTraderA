@@ -1,0 +1,30 @@
+{
+  "mcpServers": {
+    "mirae-asset-sharekhan-mcp": {
+      "command": "npx",
+      "args": [
+        "mcp-remote",
+        "https://mcp.sharekhan.com/mcp/"
+      ]
+    },
+    "coindcx": {
+      "command": "python",
+      "args": [
+        "-m",
+        "coindcx_mcp.server"
+      ],
+      "cwd": "E:\\MCPs\\coindcx-mcp-main"
+    },
+    "Upstox MCP": {
+      "url": "https://mcp.upstox.com/mcp",
+      "type": "http"
+    },
+    "playwright": {
+      "command": "npx",
+      "args": [
+        "@playwright/mcp@latest"
+      ],
+      "type": "stdio"
+    }
+  }
+}

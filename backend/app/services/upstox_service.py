@@ -1,3 +1,10 @@
+import numpy as np
+# Monkey-patch NumPy 2.0 compatibility for pandas-ta
+if not hasattr(np, "NaN"):
+    np.NaN = np.nan
+if not hasattr(np, "float_"):
+    np.float_ = float
+
 import os
 import httpx
 from upstox_client.api_client import ApiClient
@@ -19,6 +26,8 @@ import math
 
 class UpstoxService:
     def __init__(self):
+        from dotenv import load_dotenv
+        load_dotenv()
         self.api_key = os.getenv("UPSTOX_API_KEY")
         self.client_id = os.getenv("UPSTOX_API_KEY") # Upstox uses API Key as Client ID often
         self.client_secret = os.getenv("UPSTOX_API_SECRET")
@@ -29,7 +38,9 @@ class UpstoxService:
         
         # Configuration for Upstox Client
         self.configuration = config.Configuration()
-        # Ensure we set the access token when available
+        if self.api_key:
+            self.configuration.api_key['Api-Key'] = self.api_key
+        
         self.db = None
         self.expiry_cache = {} # { 'instrument_key': { 'timestamp': time, 'data': [] } }
 
@@ -1043,17 +1054,18 @@ class UpstoxService:
         """
         try:
             # Parse Interval
-            unit = "minutes"
-            in_val = "1"
-            
-            if "minute" in interval:
+            if interval in ["1minute", "15minute", "30minute", "day"]:
+                 path_interval = interval
+            else:
                  unit = "minutes"
-                 in_val = interval.replace("minute", "")
-            elif interval == "day":
-                 unit = "days"
                  in_val = "1"
-            
-            path_interval = f"{unit}/{in_val}"
+                 if "minute" in interval:
+                      unit = "minutes"
+                      in_val = interval.replace("minute", "")
+                 elif interval == "day":
+                      unit = "days"
+                      in_val = "1"
+                 path_interval = f"{unit}/{in_val}"
             encoded_key = quote(instrument_key)
             url = f"https://api.upstox.com/v3/historical-candle/intraday/{encoded_key}/{path_interval}"
             
@@ -1522,7 +1534,7 @@ class UpstoxService:
             print(f"Error fetching Upstox data: {e}")
             return None
 
-    def place_order(self, instrument_key: str, quantity: int, transaction_type: str, order_type: str = "MARKET", price: float = 0.0):
+    async def place_order(self, instrument_key: str, quantity: int, transaction_type: str, order_type: str = "MARKET", price: float = 0.0):
         """
         Places an order.
         transaction_type: BUY or SELL
@@ -1553,10 +1565,26 @@ class UpstoxService:
             
             response = order_api.place_order(req, "2.0")
             print(f"Order Placed: {response}")
+            
+            # Telegram Notification
+            try:
+                from .telegram_service import telegram_service
+                msg = (
+                    f"📝 <b>Order Placed (Upstox)</b>\n\n"
+                    f"<b>Instrument:</b> {instrument_key}\n"
+                    f"<b>Side:</b> {transaction_type}\n"
+                    f"<b>Qty:</b> {quantity}\n"
+                    f"<b>Type:</b> {order_type}\n"
+                    f"<b>Price:</b> ₹{price if price > 0 else 'MARKET'}"
+                )
+                await telegram_service.send_message(msg)
+            except: pass
+
             return {"status": "success", "data": response.data.to_dict() if hasattr(response.data, 'to_dict') else response.data}
         except Exception as e:
             print(f"Error placing order: {e}")
             return {"status": "error", "message": str(e)}
+
 
     async def cancel_all_orders(self):
         """
@@ -1672,7 +1700,7 @@ class UpstoxService:
                     # Round price to tick size (0.05)
                     price = round(price * 20) / 20
                     
-                    res = self.place_order(
+                    res = await self.place_order(
                         instrument_key=p.instrument_token,
                         quantity=qty,
                         transaction_type=txn_type,
@@ -1688,8 +1716,15 @@ class UpstoxService:
             return {"status": "success", "message": f"Placed {orders_placed} exit orders", "results": results}
             
         except Exception as e:
-            print(f"Error squaring off: {e}")
+            print(f"Error in square_off_all_positions: {e}")
             return {"status": "error", "message": str(e)}
+        finally:
+            # Telegram Notification
+            try:
+                from .telegram_service import telegram_service
+                await telegram_service.send_message("🧹 <b>Square Off All!</b>\nRequested exit for all open positions.")
+            except: pass
+
 
     async def square_off_position(self, instrument_key):
         """
@@ -1737,13 +1772,26 @@ class UpstoxService:
             
             print(f"Exiting Position: {target_pos.trading_symbol}, Qty: {abs_qty}, Txn: {txn_type}, Price: {price}")
             
-            res = self.place_order(
+            res = await self.place_order(
                 instrument_key=target_pos.instrument_token,
                 quantity=abs_qty,
                 transaction_type=txn_type,
                 order_type="LIMIT",
                 price=price
             )
+
+            # Telegram Notification
+            try:
+                from .telegram_service import telegram_service
+                msg = (
+                    f"🎯 <b>Position Squared Off (Upstox)</b>\n\n"
+                    f"<b>Instrument:</b> {target_pos.trading_symbol}\n"
+                    f"<b>Qty:</b> {abs_qty}\n"
+                    f"<b>Exit Price:</b> ₹{price}"
+                )
+                await telegram_service.send_message(msg)
+            except: pass
+
             return {"status": "success", "message": f"Exit Order Placed for {target_pos.trading_symbol} at {price}", "data": res}
             
         except Exception as e:

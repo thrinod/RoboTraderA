@@ -1,3 +1,13 @@
+import numpy as np
+from datetime import datetime, timedelta
+# Monkey-patch NumPy 2.0 compatibility for pandas-ta
+if not hasattr(np, "NaN"):
+    np.NaN = np.nan
+if not hasattr(np, "float_"):
+    np.float_ = float
+if not hasattr(np, "int_"):
+    np.int_ = int
+
 from fastapi import FastAPI, Request, Header, HTTPException, Depends, status
 from fastapi.responses import RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -8,6 +18,9 @@ from motor.motor_asyncio import AsyncIOMotorClient
 import os
 from dotenv import load_dotenv
 
+# Load env vars first!
+load_dotenv()
+
 # Import services
 from app.services.upstox_service import upstox_service
 from app.services.trading_engine import trading_engine
@@ -16,13 +29,16 @@ from app.services.alice_blue_service import alice_blue_service
 from app.services.alice_blue_service import alice_blue_service
 from app.services.scanner_populate import ScannerPopulateService
 from app.services.charges_service import charges_service
+from app.services.backtest_service import BacktestService
+from app.services.telegram_service import telegram_service
+from app.services.mirae_service import mirae_service
 
 # Global Service Instances
 scanner_populate = None
+backtest_service = BacktestService(upstox_service)
 
 import mock_npci_payment
 
-load_dotenv()
 
 MONGODB_URL = os.getenv("MONGODB_URL", "mongodb://localhost:27017")
 DB_NAME = os.getenv("MONGODB_DB_NAME", "robotrader")
@@ -40,6 +56,8 @@ async def lifespan(app: FastAPI):
         # Pass DB to Services
         trading_engine.set_db(app.mongodb)
         mock_trade_service.set_db(app.mongodb)
+        telegram_service.set_db(app.mongodb)
+        await telegram_service.load_config()
         
         # Initialize Scanner Populate Service
         global scanner_populate
@@ -81,6 +99,18 @@ async def lifespan(app: FastAPI):
             print("Inserted dummy data into upstox_collection")
             
         print(f"Connected to MongoDB at {MONGODB_URL}")
+        
+        # Auto-start Trading Engine if there are active deployments
+        try:
+            active_deployments = await app.mongodb["strategy_deployments"].count_documents({"status": "ACTIVE"})
+            if active_deployments > 0:
+                print(f"Lifespan: Found {active_deployments} active deployments. Starting Engine...")
+                await trading_engine.start_trading()
+            else:
+                print("Lifespan: No active deployments found on startup.")
+        except Exception as e:
+            print(f"Lifespan: Failed to auto-start trading engine: {e}")
+
         yield
     except Exception as e:
         print(f"CRITICAL STARTUP ERROR: {e}")
@@ -146,9 +176,16 @@ async def auth_callback(code: str):
 # --- Database Viewer Routes ---
 
 def serialize_doc(doc):
-    """Convert ObjectId to string for JSON serialization"""
-    if doc.get("_id"):
-        doc["_id"] = str(doc["_id"])
+    """Convert ObjectId and datetime to string for JSON serialization"""
+    if not doc:
+        return doc
+    for k, v in doc.items():
+        if k == "_id":
+            doc[k] = str(v)
+        elif isinstance(v, datetime):
+            doc[k] = v.isoformat()
+        elif isinstance(v, list):
+            doc[k] = [serialize_doc(i) if isinstance(i, dict) else i for i in v]
     return doc
 
 @app.get("/db/collections")
@@ -335,7 +372,9 @@ async def search_instruments(q: str = "", limit: int = 50, segment: str = None, 
     if (not q or len(q) < 2) and not has_filters:
         return {"data": []}
     
-    regex = {"$regex": q, "$options": "i"}
+    import re
+    safe_q = re.escape(q)
+    regex = {"$regex": safe_q, "$options": "i"}
     query_filters = []
     
     # Text Search - only apply if q is present
@@ -424,7 +463,7 @@ async def place_orders(req: BulkOrderRequest):
     for order in req.orders:
         # Execute each order
         # Default quantity logic? For now assume frontend sends correct Lot Size or Qty
-        res = upstox_service.place_order(
+        res = await upstox_service.place_order(
             instrument_key=order.instrument_key,
             quantity=order.quantity,
             transaction_type=order.transaction_type,
@@ -760,8 +799,7 @@ async def populate_scanner(index: str = "NIFTY 50"):
     return await service.populate_index(index)
 
 @app.post("/scanner/populate_fno")
-async def populate_scanner_fno():
-    from app.services.scanner_populate import ScannerPopulateService
+async def populate_scanner_fno_route():
     service = ScannerPopulateService(app.mongodb, upstox_service)
     return await service.populate_from_fno()
 
@@ -884,6 +922,341 @@ async def process_scanner_data(req: ScannerProcessRequest):
     print(f"Scanner Batch ({len(keys)} items, {len(valid_data)} success, {len(failed_keys)} failed) processed in {end_time - start_time:.2f} seconds.")
     
     return {"data": valid_data}
+
+class BacktestRequest(BaseModel):
+    instrument_key: Optional[str] = None
+    interval: Optional[str] = "15minute"
+    days_back: int = 30
+    stop_loss: float = 1.0
+    take_profit: float = 2.0
+    is_advanced: bool = False
+    execution_plan: Optional[list] = None
+    saved_strategies: Optional[list] = None
+    trade_type: str = "LONG"
+    trade_instrument_key: Optional[str] = None
+    use_intraday: bool = False
+
+class DeployStrategyRequest(BacktestRequest):
+    deployment_mode: str = "MOCK" # "MOCK" or "LIVE"
+    quantity_type: str = "MANUAL" # "MANUAL" or "CAPITAL" or "PERCENTAGE"
+    quantity: int = 1
+    capital_to_use: float = 0.0
+    capital_percentage: float = 0.0
+    lot_size: int = 1
+
+@app.post("/backtest/run")
+async def run_backtest(req: BacktestRequest):
+    # Determine which instrument to use for the single-leg logic bridge
+    primary_instrument = req.instrument_key
+    primary_interval = req.interval
+    
+    if req.is_advanced and req.execution_plan and len(req.execution_plan) > 0:
+        primary_instrument = req.execution_plan[0].get("leg")
+        primary_interval = req.execution_plan[0].get("timeframe")
+        
+    if not primary_instrument:
+        raise HTTPException(status_code=400, detail="No instrument key provided.")
+        
+    print(f"Running backtest for {primary_instrument} | Interval: {primary_interval} | Days: {req.days_back} | Intraday: {req.use_intraday}")
+    
+    # We pass the primary instrument to our existing service until phase 3
+    # Phase 3 will involve passing the full execution_plan and saved_strategies to the service
+    result = await backtest_service.run_strategy(
+        primary_instrument, 
+        primary_interval, 
+        req.days_back,
+        req.stop_loss,
+        req.take_profit,
+        req.is_advanced,
+        req.execution_plan,
+        req.saved_strategies,
+        req.trade_type,
+        req.trade_instrument_key,
+        use_intraday=req.use_intraday
+    )
+    return result
+
+@app.post("/deploy/strategy")
+async def deploy_strategy(req: DeployStrategyRequest):
+    import datetime
+    
+    primary_instrument = req.instrument_key
+    if req.is_advanced and req.execution_plan and len(req.execution_plan) > 0:
+        primary_instrument = req.execution_plan[0].get("leg")
+        
+    doc = req.dict()
+    doc["status"] = "ACTIVE"
+    doc["primary_instrument"] = primary_instrument
+    doc["deployed_at"] = datetime.datetime.now()
+    
+    res = await app.mongodb["strategy_deployments"].insert_one(doc)
+    doc["_id"] = str(res.inserted_id)
+    
+    # Ensure the trading engine is started when a strategy is deployed
+    await trading_engine.start_trading()
+    
+    # Telegram Notification for Deployment
+    try:
+        msg = (
+            f"🤖 <b>Strategy Deployed!</b>\n\n"
+            f"<b>Instrument:</b> {primary_instrument}\n"
+            f"<b>Mode:</b> {req.deployment_mode}\n"
+            f"<b>Quantity:</b> {req.quantity}\n"
+            f"<b>Interval:</b> {req.interval}\n"
+            f"<b>Type:</b> {'Advanced' if req.is_advanced else 'Simple'}\n"
+            f"<b>Status:</b> ACTIVE (Monitoring...)"
+        )
+        await telegram_service.send_message(msg)
+    except Exception as te:
+        print(f"Telegram Deployment Notify Error: {te}")
+    
+    return {"status": "success", "message": f"Strategy deployed successfully in {req.deployment_mode} mode", "deployment_id": doc["_id"]}
+
+@app.get("/deploy/list")
+async def list_deployments():
+    cursor = app.mongodb["strategy_deployments"].find().sort("deployed_at", -1)
+    docs = await cursor.to_list(length=100)
+    return {"data": [serialize_doc(doc) for doc in docs]}
+
+@app.post("/deploy/stop/{deployment_id}")
+async def stop_deployment(deployment_id: str):
+    from bson import ObjectId
+    await app.mongodb["strategy_deployments"].update_one(
+        {"_id": ObjectId(deployment_id)},
+        {"$set": {"status": "STOPPED", "stopped_at": datetime.now()}}
+    )
+    return {"status": "success"}
+
+@app.post("/deploy/start/{deployment_id}")
+async def start_deployment(deployment_id: str):
+    from bson import ObjectId
+    await app.mongodb["strategy_deployments"].update_one(
+        {"_id": ObjectId(deployment_id)},
+        {"$set": {"status": "ACTIVE", "resumed_at": datetime.now()}}
+    )
+    
+    # Ensure engine is running
+    if not trading_engine.active:
+        await trading_engine.start_trading()
+        
+    return {"status": "success"}
+
+@app.delete("/deploy/delete/{deployment_id}")
+async def delete_deployment(deployment_id: str):
+    from bson import ObjectId
+    # Delete the deployment itself
+    await app.mongodb["strategy_deployments"].delete_one({"_id": ObjectId(deployment_id)})
+    # Delete all associated logs
+    await app.mongodb["deployment_logs"].delete_many({"deployment_id": deployment_id})
+    return {"status": "success"}
+
+@app.post("/deploy/test/{deployment_id}")
+async def test_deployment(deployment_id: str):
+    from bson.objectid import ObjectId
+    dep = await app.mongodb["strategy_deployments"].find_one({"_id": ObjectId(deployment_id)})
+    if not dep:
+        raise HTTPException(status_code=404, detail="Deployment not found")
+        
+    # Get LTP for primary instrument
+    primary_instrument = dep.get("primary_instrument")
+    ltp = 100.0
+    try:
+        quotes = upstox_service.get_market_quotes([primary_instrument])
+        if primary_instrument in quotes:
+            ltp = quotes[primary_instrument].get('ltp', 100.0)
+    except: pass
+    
+    # Force log entry and trade execution
+    print(f"Force testing deployment {deployment_id}")
+    await app.mongodb["deployment_logs"].insert_one({
+        "deployment_id": deployment_id,
+        "timestamp": datetime.now(),
+        "instrument": primary_instrument,
+        "interval": dep.get('interval', 'N/A'),
+        "close_price": ltp,
+        "signal": True,
+        "traded": True,
+        "rules": [{"name": "TEST_TRIGGER", "result": True, "details": "Manual Override"}],
+        "message": f"Manual Test Trigger initiated for {primary_instrument} at roughly {ltp}"
+    })
+    await trading_engine.execute_trade(dep, primary_instrument, ltp)
+    return {"status": "success"}
+
+@app.get("/deploy/logs/{deployment_id}")
+async def get_deployment_logs(deployment_id: str):
+    # Only fetch logs from the last 24 hours
+    cutoff = datetime.now() - timedelta(hours=24)
+    cursor = app.mongodb["deployment_logs"].find(
+        {"deployment_id": deployment_id, "timestamp": {"$gte": cutoff}}
+    ).sort("timestamp", -1).limit(500)
+    docs = await cursor.to_list(length=500)
+    return {"data": [serialize_doc(doc) for doc in docs]}
+
+@app.get("/deploy/status")
+async def get_engine_status():
+    active_docs = await app.mongodb["strategy_deployments"].find({"status": "ACTIVE"}).to_list(100)
+    return {
+        "engine_active": trading_engine.active,
+        "engine_has_db": trading_engine.mongodb is not None,
+        "active_deployments_count": len(active_docs),
+        "upstox_authenticated": upstox_service.access_token is not None,
+    }
+
+@app.get("/settings/telegram")
+async def get_telegram_settings():
+    config = await app.mongodb["settings"].find_one({"id": "telegram_config"})
+    if config:
+        config["_id"] = str(config["_id"])
+        return config
+    return {"bot_token": "", "chat_id": "", "group_name": "", "enabled": False}
+
+@app.get("/settings/mirae")
+async def get_mirae_settings():
+    config = await app.mongodb["settings"].find_one({"id": "mirae_config"})
+    if config:
+        config["_id"] = str(config["_id"])
+        return config
+    return {"mirae_api_key": "", "mirae_access_token": "", "enabled": False}
+
+@app.post("/settings/mirae")
+async def save_mirae_settings(req: Request):
+    data = await req.json()
+    await app.mongodb["settings"].update_one(
+        {"id": "mirae_config"},
+        {"$set": {
+            "mirae_api_key": data.get("mirae_api_key"),
+            "mirae_access_token": data.get("mirae_access_token"),
+            "enabled": data.get("enabled", False),
+            "updated_at": datetime.now()
+        }},
+        upsert=True
+    )
+    return {"status": "success"}
+
+@app.get("/mirae/positions")
+async def get_mirae_positions():
+    config = await app.mongodb["settings"].find_one({"id": "mirae_config"})
+    if not config or not config.get("enabled"):
+        return {"status": "error", "message": "Mirae Asset integration is disabled or missing credentials"}
+
+    mirae_access_token = config.get("mirae_access_token") or config.get("access_token")
+    api_key = config.get("mirae_api_key") or config.get("api_key")
+
+    success, msg = mirae_service.initialize(mirae_access_token, api_key)
+    if not success:
+        return {"status": "error", "message": f"Login failed: {msg}"}
+
+    # Fetch positions
+    p_success, p_data = mirae_service.get_net_position()
+    if not p_success:
+        print("Mirae Positions Error:", p_data)
+        return {"status": "error", "message": f"Failed to get positions: {p_data}"}
+
+    print("Mirae Positions Data:", p_data)
+    return {"status": "success", "data": p_data}
+
+@app.get("/mirae/funds")
+async def get_mirae_funds():
+    config = await app.mongodb["settings"].find_one({"id": "mirae_config"})
+    if not config or not config.get("enabled"):
+        return {"status": "error", "message": "Mirae Asset integration is disabled"}
+
+    mirae_access_token = config.get("mirae_access_token") or config.get("access_token")
+    api_key = config.get("mirae_api_key") or config.get("api_key")
+    
+    success, msg = mirae_service.initialize(mirae_access_token, api_key)
+    if not success:
+        return {"status": "error", "message": f"Login failed: {msg}"}
+
+    f_success, f_data = mirae_service.get_funds()
+    if not f_success:
+        print("Mirae Funds Error:", f_data)
+        return {"status": "error", "message": f"Failed to get funds: {f_data}"}
+        
+    print("Mirae Funds Data:", f_data)
+    return {"status": "success", "data": f_data}
+
+@app.get("/settings/general")
+async def get_general_settings():
+    doc = await app.mongodb["settings"].find_one({"id": "general_config"})
+    if doc:
+        doc.pop("_id", None)
+        return doc
+    return {"enforce_market_hours": False}
+
+@app.post("/settings/general")
+async def save_general_settings(req: Request):
+    data = await req.json()
+    await app.mongodb["settings"].update_one(
+        {"id": "general_config"},
+        {"$set": {
+            "enforce_market_hours": data.get("enforce_market_hours", False),
+            "updated_at": datetime.now()
+        }},
+        upsert=True
+    )
+    return {"status": "success"}
+
+@app.post("/settings/telegram")
+async def save_telegram_settings(req: Request):
+    data = await req.json()
+    await app.mongodb["settings"].update_one(
+        {"id": "telegram_config"},
+        {"$set": {
+            "bot_token": data.get("bot_token"),
+            "chat_id": data.get("chat_id"),
+            "group_name": data.get("group_name"),
+            "enabled": data.get("enabled", False),
+            "updated_at": datetime.now()
+        }},
+        upsert=True
+    )
+    # Reload service config
+    await telegram_service.load_config()
+    return {"status": "success"}
+
+@app.post("/settings/telegram/test")
+async def test_telegram_settings(req: Request):
+    data = await req.json()
+    # Temporarily set config for test
+    old_token = telegram_service.bot_token
+    old_chat = telegram_service.chat_id
+    old_enabled = telegram_service.enabled
+    
+    telegram_service.bot_token = data.get("bot_token")
+    telegram_service.chat_id = data.get("chat_id")
+    telegram_service.enabled = True
+    
+    msg = "🔔 <b>Test Message</b>\n\nYour RoboTrader Telegram integration is working perfectly!"
+    success, err_msg = await telegram_service.send_message(msg)
+    
+    # Restore config
+    telegram_service.bot_token = old_token
+    telegram_service.chat_id = old_chat
+    telegram_service.enabled = old_enabled
+    
+    if success:
+        return {"status": "success"}
+    else:
+        return {"status": "error", "message": f"Telegram Error: {err_msg}"}
+
+@app.post("/settings/telegram/detect")
+async def detect_telegram_chat(req: Request):
+    data = await req.json()
+    # Temporarily set token for detection
+    old_token = telegram_service.bot_token
+    telegram_service.bot_token = data.get("bot_token")
+    
+    res, err_msg = await telegram_service.detect_chat_id()
+    
+    # Restore token
+    telegram_service.bot_token = old_token
+    
+    if res:
+        return {"status": "success", "data": res}
+    else:
+        return {"status": "error", "message": err_msg}
+
 @app.post("/scanner/populate_fno")
 async def populate_scanner_fno():
     """
@@ -901,9 +1274,9 @@ async def fetch_fno_from_nse():
     return res
 
 @app.post("/scanner/fetch-master")
-async def fetch_master_instruments():
+async def fetch_master_instruments(exchange: str = "NSE"):
     """
-    Downloads Upstox Master Instrument List (NSE) and populates upstox_collection
+    Downloads Upstox Master Instrument List (NSE/BSE) and populates upstox_collection
     """
-    res = await scanner_populate.fetch_master_instruments()
+    res = await scanner_populate.fetch_master_instruments(exchange=exchange)
     return res

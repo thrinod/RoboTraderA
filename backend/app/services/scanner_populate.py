@@ -23,8 +23,10 @@ class ScannerPopulateService:
     def __init__(self, db, upstox_service):
         self.db = db
         self.upstox = upstox_service
-        # Upstox Instrument File URL (Gzip)
-        self.instrument_url = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.csv.gz"
+        # Upstox Instrument File URLs (Gzip)
+        self.nse_url = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.csv.gz"
+        self.bse_url = "https://assets.upstox.com/market-quote/instruments/exchange/BSE.csv.gz"
+        self.instrument_url = self.nse_url # Default
 
     async def populate_index(self, index_name: str):
         """
@@ -159,10 +161,10 @@ class ScannerPopulateService:
             print(f"Found {len(fno_symbols)} FNO Symbols. Matching with Upstox DB...")
 
             # 2. Match with Upstox Collection (NSE_EQ)
-            # Auto-fetch master instruments if collection is empty
+            # Auto-fetch master instruments if collection is empty or has only dummy data
             eq_count = await self.db["upstox_collection"].count_documents({"exchange": {"$in": ["NSE_EQ", "NSE"]}})
-            if eq_count == 0:
-                print("upstox_collection is empty! Auto-fetching master instruments...")
+            if eq_count < 1000:
+                print("upstox_collection is empty or partial! Auto-fetching master instruments...")
                 await self.fetch_master_instruments()
 
             # Fetch all possible NSE Equity instruments
@@ -180,7 +182,8 @@ class ScannerPopulateService:
             upstox_map = {}
             for doc in all_eq_docs:
                 ts = doc.get('trading_symbol', '').upper().strip()
-                itype = doc.get('instrument_type', '').upper()
+                itype = doc.get('instrument_type')
+                itype = itype.upper() if itype else ""
                 
                 # Only interested in Equities for FNO matching
                 if itype not in ['EQ', 'EQUITY']:
@@ -390,15 +393,14 @@ class ScannerPopulateService:
             traceback.print_exc()
             return {"status": "error", "message": str(e)}
 
-    async def fetch_master_instruments(self):
+    async def fetch_master_instruments(self, exchange="NSE"):
         """
-        Downloads and parses the Upstox Master Instrument file (NSE.csv.gz).
-        Populates 'upstox_collection' with ALL NSE instruments.
-        URL: https://assets.upstox.com/market-quote/instruments/exchange/NSE.csv.gz
+        Downloads and parses the Upstox Master Instrument file.
+        Populates 'upstox_collection' with ALL instruments from the exchange.
         """
         try:
-            url = self.instrument_url
-            print(f"Downloading Master Instruments from {url}...")
+            url = self.nse_url if exchange == "NSE" else self.bse_url
+            print(f"Downloading {exchange} Master Instruments from {url}...")
             
             async with httpx.AsyncClient(verify=False, timeout=60.0) as client:
                 resp = await client.get(url)
@@ -449,9 +451,11 @@ class ScannerPopulateService:
             batch_size = 5000
             total_inserted = 0
             
-            # Clear existing? Yes, full refresh.
-            await self.db["upstox_collection"].delete_many({})
-            print("Cleared existing upstox_collection.")
+            # Clear existing for this exchange? 
+            # If we want a clean state for the exchange, delete only its records.
+            # BSE and NSE keys are distinct.
+            await self.db["upstox_collection"].delete_many({"exchange": {"$regex": f"^{exchange}"}})
+            print(f"Cleared existing {exchange} instruments from upstox_collection.")
             
             operations = []
             for row in records:
