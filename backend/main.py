@@ -504,17 +504,19 @@ async def stop_trading():
 async def place_orders(req: BulkOrderRequest):
     results = []
     print(f"Received {len(req.orders)} orders")
-    for order in req.orders:
-        # Execute each order
-        # Default quantity logic? For now assume frontend sends correct Lot Size or Qty
-        res = await upstox_service.place_order(
+    async def process_order(order):
+        return await upstox_service.place_order(
             instrument_key=order.instrument_key,
             quantity=order.quantity,
             transaction_type=order.transaction_type,
             order_type=order.order_type,
             price=order.price
         )
-        results.append({"key": order.instrument_key, "result": res})
+    
+    import asyncio
+    res_list = await asyncio.gather(*(process_order(o) for o in req.orders))
+    
+    results = [{"key": o.instrument_key, "result": r} for o, r in zip(req.orders, res_list)]
     
     return {"status": "completed", "results": results}
 
@@ -807,6 +809,23 @@ class MockOrderRequest(BaseModel):
 @app.post("/trade/mock/place")
 async def place_mock_order(order: MockOrderRequest):
     return await mock_trade_service.place_order(order.dict())
+
+@app.post("/trade/mock/place_orders")
+async def place_mock_orders(req: BulkOrderRequest):
+    import asyncio
+    
+    async def process_mock(o):
+        return await mock_trade_service.place_order({
+            "instrument_key": o.instrument_key,
+            "quantity": o.quantity,
+            "transaction_type": o.transaction_type,
+            "order_type": o.order_type,
+            "price": o.price
+        })
+        
+    res_list = await asyncio.gather(*(process_mock(o) for o in req.orders))
+    results = [{"key": o.instrument_key, "result": r} for o, r in zip(req.orders, res_list)]
+    return {"status": "completed", "results": results}
 
 @app.get("/trade/mock/positions")
 async def get_mock_positions():

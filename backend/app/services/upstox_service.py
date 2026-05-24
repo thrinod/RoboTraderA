@@ -1660,7 +1660,16 @@ class UpstoxService:
             return {"status": "error", "message": "No Access Token"}
             
         try:
-            api_client = ApiClient(self.configuration)
+            use_sub_server = os.getenv("USE_SUB_SERVER", "false").lower() == "true"
+            if use_sub_server:
+                conf = config.Configuration()
+                conf.access_token = self.access_token
+                if self.api_key:
+                    conf.api_key['Api-Key'] = self.api_key
+                conf.host = os.getenv("SUB_SERVER_URL", conf.host).rstrip("/")
+                api_client = ApiClient(conf)
+            else:
+                api_client = ApiClient(self.configuration)
             if self.algo_name:
                 api_client.set_default_header("X-Algo-Name", self.algo_name)
             order_api = OrderApi(api_client)
@@ -1679,7 +1688,8 @@ class UpstoxService:
                 is_amo=False
             )
             
-            response = order_api.place_order(req, "2.0")
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(None, order_api.place_order, req, "2.0")
             print(f"Order Placed: {response}")
             
             # Telegram Notification
@@ -1715,7 +1725,16 @@ class UpstoxService:
             return {"status": "error", "message": "No Access Token"}
             
         try:
-            api_client = ApiClient(self.configuration)
+            use_sub_server = os.getenv("USE_SUB_SERVER", "false").lower() == "true"
+            if use_sub_server:
+                conf = config.Configuration()
+                conf.access_token = self.access_token
+                if self.api_key:
+                    conf.api_key['Api-Key'] = self.api_key
+                conf.host = os.getenv("SUB_SERVER_URL", conf.host).rstrip("/")
+                api_client = ApiClient(conf)
+            else:
+                api_client = ApiClient(self.configuration)
             if self.algo_name:
                 api_client.set_default_header("X-Algo-Name", self.algo_name)
             order_api = OrderApi(api_client)
@@ -1738,13 +1757,20 @@ class UpstoxService:
             print(f"Cancelling {len(open_orders)} orders...")
             cancelled_count = 0
             
-            # 2. Cancel Each
-            for order in open_orders:
-                try:
-                    order_api.cancel_order(order.order_id, "2.0")
+            # 2. Cancel Each concurrently
+            loop = asyncio.get_event_loop()
+            
+            async def cancel_single(order_id):
+                return await loop.run_in_executor(None, order_api.cancel_order, order_id, "2.0")
+                
+            tasks = [cancel_single(order.order_id) for order in open_orders]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            for order, res in zip(open_orders, results):
+                if isinstance(res, Exception):
+                    print(f"Failed to cancel {order.order_id}: {res}")
+                else:
                     cancelled_count += 1
-                except Exception as e:
-                    print(f"Failed to cancel {order.order_id}: {e}")
                     
             return {"status": "success", "message": f"Cancelled {cancelled_count} orders", "count": cancelled_count}
             
@@ -1793,34 +1819,28 @@ class UpstoxService:
             orders_placed = 0
             results = []
             
-            # 2. Square Off Each
-            for p in open_positions:
+            # 2. Square Off Each concurrently
+            async def process_position(p):
+                # Re-fetch qty safely
+                qty = getattr(p, 'net_quantity', getattr(p, 'quantity', 0))
+                
+                if qty == 0: return {"key": p.trading_symbol, "status": "skipped"}
+                
+                row_net_qty = qty
+                qty = abs(qty)
+                
+                txn_type = "SELL" if row_net_qty > 0 else "BUY"
+                ltp = getattr(p, 'last_price', 0.0)
+                
+                price = 0.0
+                if txn_type == "SELL":
+                    price = ltp - 0.5
+                else:
+                    price = ltp + 0.5
+                    
+                price = round(price * 20) / 20
+                
                 try:
-                    # Re-fetch qty safely
-                    qty = getattr(p, 'net_quantity', getattr(p, 'quantity', 0))
-                    
-                    if qty == 0: continue # Should not happen given filter
-                    
-                    row_net_qty = qty # Store signed quantity for direction check
-                    qty = abs(qty) # Absolute for order placement
-                    
-                    txn_type = "SELL" if row_net_qty > 0 else "BUY"
-                    
-                    # Logic: User wants LTP - 0.5 (aggressive exit)
-                    # We need LTP. Position object usually has 'last_price' or 'ltp' but better to be safe.
-                    # Assuming p.last_price is reasonably fresh or fetch fresh?
-                    # Upstox positions usually have ltp.
-                    ltp = p.last_price
-                    
-                    price = 0.0
-                    if txn_type == "SELL":
-                        price = ltp - 0.5
-                    else:
-                        price = ltp + 0.5 # Symmetric logic for Short Cover
-                        
-                    # Round price to tick size (0.05)
-                    price = round(price * 20) / 20
-                    
                     res = await self.place_order(
                         instrument_key=p.instrument_token,
                         quantity=qty,
@@ -1828,11 +1848,20 @@ class UpstoxService:
                         order_type="LIMIT",
                         price=price
                     )
-                    results.append({"key": p.trading_symbol, "status": res.get("status"), "price": price})
-                    orders_placed += 1
+                    return {"key": p.trading_symbol, "status": res.get("status"), "price": price}
                 except Exception as e:
-                    print(f"Failed to square off {p.trading_symbol}: {e}")
-                    results.append({"key": p.trading_symbol, "status": "error", "error": str(e)})
+                    return {"key": p.trading_symbol, "status": "error", "error": str(e)}
+
+            tasks = [process_position(p) for p in open_positions]
+            results_list = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            for res in results_list:
+                if isinstance(res, Exception):
+                    results.append({"status": "error", "error": str(res)})
+                else:
+                    results.append(res)
+                    if res.get("status") == "success":
+                        orders_placed += 1
                     
             return {"status": "success", "message": f"Placed {orders_placed} exit orders", "results": results}
             
