@@ -1660,6 +1660,7 @@ class UpstoxService:
             return {"status": "error", "message": "No Access Token"}
             
         try:
+            # Reverting back to .env usage now that we found the SDK bug
             use_sub_server = os.getenv("USE_SUB_SERVER", "false").lower() == "true"
             if use_sub_server:
                 conf = config.Configuration()
@@ -1667,6 +1668,8 @@ class UpstoxService:
                 if self.api_key:
                     conf.api_key['Api-Key'] = self.api_key
                 conf.host = os.getenv("SUB_SERVER_URL", conf.host).rstrip("/")
+                if hasattr(conf, 'order_host'):
+                    conf.order_host = conf.host
                 api_client = ApiClient(conf)
             else:
                 api_client = ApiClient(self.configuration)
@@ -1732,6 +1735,8 @@ class UpstoxService:
                 if self.api_key:
                     conf.api_key['Api-Key'] = self.api_key
                 conf.host = os.getenv("SUB_SERVER_URL", conf.host).rstrip("/")
+                if hasattr(conf, 'order_host'):
+                    conf.order_host = conf.host
                 api_client = ApiClient(conf)
             else:
                 api_client = ApiClient(self.configuration)
