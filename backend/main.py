@@ -8,7 +8,7 @@ if not hasattr(np, "float_"):
 if not hasattr(np, "int_"):
     np.int_ = int
 
-from fastapi import FastAPI, Request, Header, HTTPException, Depends, status
+from fastapi import FastAPI, Request, Header, HTTPException, Depends, status, WebSocket, WebSocketDisconnect
 from fastapi.responses import RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -62,6 +62,36 @@ async def lifespan(app: FastAPI):
         # Initialize Scanner Populate Service
         global scanner_populate
         scanner_populate = ScannerPopulateService(app.mongodb, upstox_service)
+        
+        # Create Indexes for high performance (App Start "Cache" optimization)
+        print("Ensuring Database Indexes for Scanner...")
+        await app.mongodb["scanner_instruments_main"].create_index("instrument_key", unique=True)
+        await app.mongodb["scanner_instruments_main"].create_index("name")
+        await app.mongodb["upstox_collection"].create_index("trading_symbol")
+        await app.mongodb["upstox_collection"].create_index("instrument_key")
+        await app.mongodb["scanner_instruments"].create_index("SYMBOL")
+        
+        # Deduplicate scanner_results before creating unique index
+        try:
+            pipeline = [
+                {"$group": {"_id": "$instrument_key", "count": {"$sum": 1}, "ids": {"$push": "$_id"}}},
+                {"$match": {"count": {"$gt": 1}}}
+            ]
+            duplicates = await app.mongodb["scanner_results"].aggregate(pipeline).to_list(length=1000)
+            if duplicates:
+                print(f"Found {len(duplicates)} duplicate instrument keys in scanner_results. Cleaning up...")
+                for doc in duplicates:
+                    # Keep the first one, delete the rest
+                    ids_to_delete = doc["ids"][1:]
+                    await app.mongodb["scanner_results"].delete_many({"_id": {"$in": ids_to_delete}})
+            
+            await app.mongodb["scanner_results"].create_index("instrument_key", unique=True)
+        except Exception as e:
+            print(f"Warning: Could not create unique index on scanner_results: {e}")
+            # Fallback to non-unique index if unique build still fails
+            await app.mongodb["scanner_results"].create_index("instrument_key")
+            
+        print("Indexes Ready.")
         
         # Check if collection is empty and insert dummy data if needed
         count = await app.mongodb["upstox_collection"].count_documents({})
@@ -123,12 +153,17 @@ async def lifespan(app: FastAPI):
             app.mongodb_client.close()
         print("Disconnected from MongoDB")
 
-async def verify_app_token(request: Request, x_app_token: str = Header(None)):
-    if request.url.path == "/process-payment" or request.url.path.endswith("/process-payment"):
+from starlette.requests import HTTPConnection
+
+async def verify_app_token(conn: HTTPConnection, x_app_token: str = Header(None)):
+    if conn.url.path.startswith("/ws/"):
+        return
+    if conn.url.path == "/process-payment" or conn.url.path.endswith("/process-payment"):
         return
         
     expected_token = os.getenv("APP_PASSWORD", "admin")
     if expected_token and x_app_token != expected_token:
+        # For websockets, we could raise WebSocketException, but we already returned above
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid application token"
@@ -169,8 +204,9 @@ async def get_login_url_json():
     return {"login_url": url}
 
 @app.get("/auth/callback")
-async def auth_callback(code: str):
+async def auth_callback(request: Request, code: str):
     token = await upstox_service.exchange_code_for_token(code)
+    await upstox_service.save_token(request.app.mongodb, token)
     return {"message": "Authenticated successfully", "access_token": token}
 
 # --- Database Viewer Routes ---
@@ -399,14 +435,22 @@ async def search_instruments(q: str = "", limit: int = 50, segment: str = None, 
     if instrument_type:
         query_filters.append({"instrument_type": instrument_type})
     if mtf_enabled:
-        # Assuming field name is mtf_enabled
         query_filters.append({"mtf_enabled": True})
     
     query = {"$and": query_filters} if query_filters else {}
     
-    cursor = app.mongodb["upstox_collection"].find(query).limit(limit)
+    # Prioritize NSE_EQ by sorting or by doing two fetches
+    # For simplicity, we'll fetch NSE_EQ first, then the rest if limit not reached
+    cursor = app.mongodb["upstox_collection"].find(query).sort([("exchange", -1), ("name", 1)]).limit(limit)
     docs = await cursor.to_list(length=limit)
-    return {"data": [serialize_doc(doc) for doc in docs]}
+    
+    # Map 'NSE' to 'NSE_EQ' if needed for display consistency
+    serialized = []
+    for doc in docs:
+        d = serialize_doc(doc)
+        serialized.append(d)
+        
+    return {"data": serialized}
 
 @app.get("/market/instruments/types")
 async def get_instrument_types():
@@ -531,11 +575,80 @@ async def get_option_chain(instrument_key: str, expiry_date: str):
     # expiry_date example: 2025-12-28
     spot_price = await upstox_service.get_spot_price(instrument_key)
     result = await upstox_service.get_option_chain(instrument_key, expiry_date)
+    if not isinstance(result, dict):
+        result = {}
     return {
         "data": result.get('chain', []),
         "spot_price": spot_price,
         "totals": result.get('totals', {'ce': 0, 'pe': 0})
     }
+
+import json
+import asyncio
+
+@app.websocket("/ws/option-chain")
+async def ws_option_chain(websocket: WebSocket):
+    await websocket.accept()
+    
+    task = None
+    
+    async def fetch_and_push(instrument_key: str, expiry_date: str, interval: float):
+        while True:
+            try:
+                # Lazy load token if needed
+                if not upstox_service.access_token:
+                    await upstox_service.load_token(app.mongodb)
+                
+                spot_price = await upstox_service.get_spot_price(instrument_key)
+                result = await upstox_service.get_option_chain(instrument_key, expiry_date)
+                if not isinstance(result, dict):
+                    result = {}
+                
+                payload = {
+                    "status": "success",
+                    "data": {
+                        "chain": result.get('chain', []),
+                        "spot_price": spot_price or 0,
+                        "totals": result.get('totals', {'ce': 0, 'pe': 0})
+                    }
+                }
+                await websocket.send_json(payload)
+            except Exception as e:
+                print(f"Error in ws_option_chain fetch_and_push loop: {e}")
+                try:
+                    await websocket.send_json({"status": "error", "message": str(e)})
+                except:
+                    pass
+            await asyncio.sleep(interval)
+
+    try:
+        while True:
+            data = await websocket.receive_text()
+            try:
+                msg = json.loads(data)
+                if msg.get("action") == "subscribe":
+                    instrument_key = msg.get("instrument_key")
+                    expiry_date = msg.get("expiry_date")
+                    interval = float(msg.get("interval", 2.0))
+                    
+                    if not instrument_key or not expiry_date:
+                        await websocket.send_json({"status": "error", "message": "Missing instrument_key or expiry_date"})
+                        continue
+                    
+                    if task:
+                        task.cancel()
+                    
+                    task = asyncio.create_task(fetch_and_push(instrument_key, expiry_date, interval))
+                    print(f"Option Chain WS Subscribed to {instrument_key} | Expiry: {expiry_date}")
+            except json.JSONDecodeError:
+                await websocket.send_json({"status": "error", "message": "Invalid JSON"})
+            except Exception as e:
+                await websocket.send_json({"status": "error", "message": str(e)})
+    except WebSocketDisconnect:
+        print("Option Chain WS Client Disconnected")
+    finally:
+        if task:
+            task.cancel()
 
 # --- Snapshots ---
 class SnapshotItem(BaseModel):
@@ -731,7 +844,7 @@ class ScannerInstrumentItem(BaseModel):
 
 @app.get("/scanner/instruments")
 async def get_scanner_instruments():
-    # Switch to 'scanner_instruments_main'
+    # Use 'scanner_instruments_main' as the source of truth for the scanner list
     cursor = app.mongodb["scanner_instruments_main"].find().sort("name", 1)
     docs = await cursor.to_list(length=10000) 
     return {"data": [serialize_doc(doc) for doc in docs]}
@@ -755,16 +868,18 @@ async def add_scanner_instrument(items: List[ScannerInstrumentItem]):
         )
     
     if operations:
-        await app.mongodb["scanner_instruments"].bulk_write(operations)
+        await app.mongodb["scanner_instruments_main"].bulk_write(operations)
     
     return {"status": "success", "message": f"Processed {len(items)} instruments"}
 
 @app.delete("/scanner/instruments/{instrument_key}")
 async def remove_scanner_instrument(instrument_key: str):
-    res = await app.mongodb["scanner_instruments"].delete_one({"instrument_key": instrument_key})
+    res = await app.mongodb["scanner_instruments_main"].delete_one({"instrument_key": instrument_key})
     return {"status": "success", "deleted_count": res.deleted_count}
 
-    await app.mongodb["scanner_instruments"].delete_many({})
+@app.delete("/scanner/instruments")
+async def clear_scanner_instruments():
+    await app.mongodb["scanner_instruments_main"].delete_many({})
     return {"status": "success"}
 
 def sanitize_nan(obj):
@@ -781,8 +896,8 @@ def sanitize_nan(obj):
 @app.get("/scanner/results")
 async def get_scanner_results():
     try:
-        cursor = app.mongodb["scanner_latest_results"].find({})
-        results = await cursor.to_list(length=5000)
+        cursor = app.mongodb["scanner_results"].find({})
+        results = await cursor.to_list(length=10000)
         for r in results:
             if "_id" in r: del r["_id"]
         
@@ -803,6 +918,11 @@ async def populate_scanner_fno_route():
     service = ScannerPopulateService(app.mongodb, upstox_service)
     return await service.populate_from_fno()
 
+@app.post("/scanner/populate_all")
+async def populate_scanner_all_route():
+    service = ScannerPopulateService(app.mongodb, upstox_service)
+    return await service.populate_all_stocks()
+
 class ScannerProcessRequest(BaseModel):
     interval: str = "1minute"
     instrument_keys: Optional[List[str]] = None # Optional: if empty, process all in DB
@@ -815,8 +935,8 @@ async def process_scanner_data(req: ScannerProcessRequest):
     if req.instrument_keys:
         keys = req.instrument_keys
     else:
-        # Fetch from DB
-        cursor = app.mongodb["scanner_instruments"].find({}, {"instrument_key": 1})
+        # Fetch from DB (Always use scanner_instruments_main)
+        cursor = app.mongodb["scanner_instruments_main"].find({}, {"instrument_key": 1})
         docs = await cursor.to_list(length=10000)
         keys = [d["instrument_key"] for d in docs]
 
@@ -825,9 +945,11 @@ async def process_scanner_data(req: ScannerProcessRequest):
 
     # 2. Force Refresh: Delete existing results if requested
     if req.force_refresh:
-        # print(f"Force Refresh: Deleting results for {len(keys)} instruments.")
         try:
-            await app.mongodb["scanner_latest_results"].delete_many({"instrument_key": {"$in": keys}})
+            # Delete from the unified results collection
+            await app.mongodb["scanner_results"].delete_many({"instrument_key": {"$in": keys}})
+            # Also clear candles cache to ensure fresh data fetch
+            await app.mongodb["instrument_candles"].delete_many({"instrument_key": {"$in": keys}})
         except Exception as e:
             print(f"Error during force refresh delete: {e}")
 
@@ -868,9 +990,8 @@ async def process_scanner_data(req: ScannerProcessRequest):
     
     for k in keys:
         try:
-             # Direct call, no semaphore needed since it's sequential
-             # Use new full orchestration
-             res = await upstox_service.process_instrument_full(k, req.interval, app.mongodb, req.mode)
+             # Direct call, pass force_refresh to ensure it's honored
+             res = await upstox_service.process_instrument_full(k, req.interval, app.mongodb, req.mode, force=req.force_refresh)
              results.append(res)
         except Exception as e:
              print(f"Loop Error {k}: {e}")
@@ -890,37 +1011,8 @@ async def process_scanner_data(req: ScannerProcessRequest):
         for fk in failed_keys:
             print(f"  FAILED: {fk}")
         print(f"=== END FAILED INSTRUMENTS ===")
-
-    # 3. Save to Database (Persist Results)
-    if valid_data:
-        from pymongo import UpdateOne
-        import datetime
-        
-        operations = []
-        timestamp = datetime.datetime.now().isoformat()
-        
-        for item in valid_data:
-            key = item.get("instrument_key")
-            if key:
-                # Add timestamp
-                item["updated_at"] = timestamp
-                operations.append(
-                    UpdateOne(
-                        {"instrument_key": key},
-                        {"$set": item},
-                        upsert=True
-                    )
-                )
-        
-        if operations:
-            try:
-                await app.mongodb["scanner_results"].bulk_write(operations)
-                print(f"Saved {len(operations)} records to DB")
-            except Exception as e:
-                print(f"DB Save Error: {e}")
     
-    print(f"Scanner Batch ({len(keys)} items, {len(valid_data)} success, {len(failed_keys)} failed) processed in {end_time - start_time:.2f} seconds.")
-    
+    print(f"Scanner Batch ({len(keys)} items, {len(valid_data)} success, {len(failed_keys)} failed) processed in {time.time() - start_time:.2f} seconds.")
     return {"data": valid_data}
 
 class BacktestRequest(BaseModel):
@@ -935,6 +1027,8 @@ class BacktestRequest(BaseModel):
     trade_type: str = "LONG"
     trade_instrument_key: Optional[str] = None
     use_intraday: bool = False
+    trailing_sl: bool = False
+    trailing_sl_trigger_pct: float = 40.0 # Percentage profit to trigger move to BE
 
 class DeployStrategyRequest(BacktestRequest):
     deployment_mode: str = "MOCK" # "MOCK" or "LIVE"
@@ -997,9 +1091,11 @@ async def deploy_strategy(req: DeployStrategyRequest):
     
     # Telegram Notification for Deployment
     try:
+        resolved_symbol = await telegram_service.get_symbol_info(primary_instrument)
         msg = (
             f"🤖 <b>Strategy Deployed!</b>\n\n"
-            f"<b>Instrument:</b> {primary_instrument}\n"
+            f"<b>Instrument:</b> {resolved_symbol}\n"
+            f"<b>Key:</b> {primary_instrument}\n"
             f"<b>Mode:</b> {req.deployment_mode}\n"
             f"<b>Quantity:</b> {req.quantity}\n"
             f"<b>Interval:</b> {req.interval}\n"
@@ -1182,7 +1278,7 @@ async def get_general_settings():
     if doc:
         doc.pop("_id", None)
         return doc
-    return {"enforce_market_hours": False}
+    return {"enforce_market_hours": False, "pause_all_deployments": False}
 
 @app.post("/settings/general")
 async def save_general_settings(req: Request):
@@ -1191,11 +1287,24 @@ async def save_general_settings(req: Request):
         {"id": "general_config"},
         {"$set": {
             "enforce_market_hours": data.get("enforce_market_hours", False),
+            "pause_all_deployments": data.get("pause_all_deployments", False),
             "updated_at": datetime.now()
         }},
         upsert=True
     )
     return {"status": "success"}
+
+@app.post("/settings/general/toggle-pause")
+async def toggle_pause_deployments():
+    doc = await app.mongodb["settings"].find_one({"id": "general_config"})
+    current = doc.get("pause_all_deployments", False) if doc else False
+    new_val = not current
+    await app.mongodb["settings"].update_one(
+        {"id": "general_config"},
+        {"$set": {"pause_all_deployments": new_val, "updated_at": datetime.now()}},
+        upsert=True
+    )
+    return {"status": "success", "pause_all_deployments": new_val}
 
 @app.post("/settings/telegram")
 async def save_telegram_settings(req: Request):
@@ -1257,13 +1366,6 @@ async def detect_telegram_chat(req: Request):
     else:
         return {"status": "error", "message": err_msg}
 
-@app.post("/scanner/populate_fno")
-async def populate_scanner_fno():
-    """
-    Populates scanner_instruments from the local fno_stocks collection
-    """
-    res = await scanner_populate.populate_from_fno()
-    return res
 
 @app.post("/scanner/fetch-fno")
 async def fetch_fno_from_nse():

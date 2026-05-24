@@ -14,11 +14,8 @@ class TradingEngine:
         self.strategies = []
         self.mongodb = None # Will be set by main.py
         self.instrument_key = "NSE_INDEX|Nifty 50" # Default instrument
-        self.last_run = None
         self.loop_task = None
-        self.instrument_key = "NSE_INDEX|Nifty 50" # Default instrument
-        self.last_run = None
-        self.loop_task = None
+        self.symbol_cache = {} # Cache for instrument_key -> trading_symbol mapping
 
     def set_db(self, db):
         self.mongodb = db
@@ -52,27 +49,34 @@ class TradingEngine:
             self._debug_log("Engine: MongoDB not set, skipping")
             return
 
-        # Check Trading Hours Constraint
+        # Check Global Settings Constraints
         try:
             general_config = await self.mongodb["settings"].find_one({"id": "general_config"})
-            if general_config and general_config.get("enforce_market_hours", False):
-                now = datetime.now().time()
-                import datetime as dt
-                market_start = dt.time(9, 0)
-                market_end = dt.time(15, 30)
-                if not (market_start <= now <= market_end):
-                    # print("Outside market hours. Skipping deployment evaluations.")
-                    return
+            if general_config:
+                # Check Pause All
+                if general_config.get("pause_all_deployments", False):
+                    return  # Silently skip all evaluations when paused
+                # Check Trading Hours
+                if general_config.get("enforce_market_hours", False):
+                    now = datetime.now().time()
+                    import datetime as dt
+                    market_start = dt.time(9, 0)
+                    market_end = dt.time(15, 30)
+                    if not (market_start <= now <= market_end):
+                        return
         except Exception as e:
-            print(f"Error checking market hours: {e}")
+            print(f"Error checking global config: {e}")
 
-        # 1. Fetch Active Deployments
+        # 1. Fetch Active + Monitoring Deployments
         try:
-            cursor = self.mongodb["strategy_deployments"].find({"status": "ACTIVE"})
+            cursor = self.mongodb["strategy_deployments"].find({"status": {"$in": ["ACTIVE", "MONITORING"]}})
             deployments = await cursor.to_list(length=100)
         except Exception as e:
             print(f"Error fetching deployments: {e}")
             return
+
+        active_deps = [d for d in deployments if d.get('status') == 'ACTIVE']
+        monitoring_deps = [d for d in deployments if d.get('status') == 'MONITORING']
 
         # 2. Evaluate deployments concurrently with a concurrency limit
         sem = asyncio.Semaphore(5) # Limit to 5 concurrent evaluations to avoid API rate limits
@@ -101,7 +105,17 @@ class TradingEngine:
                         except Exception as le:
                             print(f"Double error! Failed to log error to DB: {le}")
 
-        tasks = [_safe_evaluate(dep) for dep in deployments]
+        async def _safe_monitor(dep):
+            async with sem:
+                try:
+                    await asyncio.wait_for(self.monitor_position(dep), timeout=15.0)
+                except asyncio.TimeoutError:
+                    print(f"TIMEOUT monitoring deployment {dep.get('_id')}")
+                except Exception as e:
+                    print(f"Error monitoring deployment {dep.get('_id')}: {e}")
+
+        tasks = [_safe_evaluate(dep) for dep in active_deps]
+        tasks += [_safe_monitor(dep) for dep in monitoring_deps]
         if tasks:
             await asyncio.gather(*tasks)
 
@@ -133,15 +147,39 @@ class TradingEngine:
         if not ik:
             return
 
-        # 1. Fetch Latest Data
+        # 1. Fetch Latest Data (Two-stage: Intraday first, then Historical fallback)
+        df = None
         try:
-            df = await upstox_service._fetch_historical_df(ik, interval, days_back_override=2)
+            # Stage 1: Try intraday API (works reliably for F&O and current day)
+            if interval != "day":
+                df_intraday = await upstox_service._fetch_intraday_df(ik, interval)
+            else:
+                df_intraday = pd.DataFrame()
+
+            # Stage 2: Fetch historical data for indicator lookback
+            df_historical = await upstox_service._fetch_historical_df(ik, interval, days_back_override=5)
+
+            # Merge: combine historical + intraday, deduplicate by timestamp
+            frames = []
+            if df_historical is not None and not df_historical.empty:
+                frames.append(df_historical)
+            if df_intraday is not None and not df_intraday.empty:
+                frames.append(df_intraday)
+
+            if frames:
+                df = pd.concat(frames)
+                df = df[~df.index.duplicated(keep='last')]  # Keep latest data on overlap
+                df.sort_index(inplace=True)
         except Exception as e:
             raise e
 
-        if df is None or df.empty or len(df) < 30:
+        # F&O instruments may have fewer candles; use a lower threshold
+        is_fno = ik.startswith("NSE_FO") or ik.startswith("BSE_FO")
+        min_candles = 5 if is_fno else 20
+
+        if df is None or df.empty or len(df) < min_candles:
             candle_count = 0 if df is None else len(df)
-            error_msg = f"Data fetch failed for {ik}: got {candle_count} candles (need 30+). Check Upstox token."
+            error_msg = f"Data fetch failed for {ik}: got {candle_count} candles (need {min_candles}+). Check Upstox token."
             if self.mongodb is not None:
                 await self.mongodb["deployment_logs"].insert_one({
                     "deployment_id": str(dep["_id"]),
@@ -155,14 +193,18 @@ class TradingEngine:
                 })
             return
 
-        # 2. Calculate Indicators
+        # 2. Calculate Indicators (resilient to low candle counts)
         try:
-            df.ta.bbands(length=20, std=2, append=True)
-            df.ta.stoch(k=14, d=3, smooth_k=3, append=True)
-            df.ta.macd(fast=12, slow=26, signal=9, append=True)
-            df.ta.stochrsi(length=14, rsi_length=14, k=3, d=3, append=True)
+            if len(df) >= 20:
+                df.ta.bbands(length=20, std=2, append=True)
+            if len(df) >= 14:
+                df.ta.stoch(k=14, d=3, smooth_k=3, append=True)
+            if len(df) >= 26:
+                df.ta.macd(fast=12, slow=26, signal=9, append=True)
+            if len(df) >= 14:
+                df.ta.stochrsi(length=14, rsi_length=14, k=3, d=3, append=True)
         except Exception as e:
-            raise e
+            print(f"Indicator calc warning for {ik}: {e}")
 
         # 3. Evaluate Logic
         has_signal = False
@@ -308,7 +350,13 @@ class TradingEngine:
                 num_lots = math.floor(calculated_capital / cost_per_lot)
                 qty = num_lots * lot_size
                 if qty <= 0:
-                    msg = f"⚠️ <b>Trade Skipped</b>\nAllocated Capital (₹{calculated_capital:.2f}) is too low to buy 1 lot. Cost/Lot: ₹{cost_per_lot:.2f}"
+                    resolved_symbol = await self.get_symbol_info(trade_instrument_key)
+                    msg = (
+                        f"⚠️ <b>Trade Skipped</b>\n\n"
+                        f"<b>Instrument:</b> {resolved_symbol}\n"
+                        f"<b>Key:</b> {trade_instrument_key}\n"
+                        f"Allocated Capital (₹{calculated_capital:.2f}) is too low to buy 1 lot. Cost/Lot: ₹{cost_per_lot:.2f}"
+                    )
                     print(f"Engine: {msg}")
                     try:
                         await telegram_service.send_message(msg)
@@ -333,22 +381,328 @@ class TradingEngine:
                 order_type="MARKET"
             )
             
-        # Update deployment status to COMPLETED (Single trade per deployment for now)
+        # Calculate SL/TP price levels
+        stop_loss_pct = dep.get('stop_loss', 0)
+        take_profit_pct = dep.get('take_profit', 0)
+        direction = dep.get('trade_type', 'LONG')
+
+        sl_price = 0
+        tp_price = 0
+        if direction == 'LONG':
+            if stop_loss_pct > 0:
+                sl_price = round(trade_price * (1 - stop_loss_pct / 100), 2)
+            if take_profit_pct > 0:
+                tp_price = round(trade_price * (1 + take_profit_pct / 100), 2)
+        else:  # SHORT
+            if stop_loss_pct > 0:
+                sl_price = round(trade_price * (1 + stop_loss_pct / 100), 2)
+            if take_profit_pct > 0:
+                tp_price = round(trade_price * (1 - take_profit_pct / 100), 2)
+
+        # Update deployment: move to MONITORING with entry details
+        update_fields = {
+            "status": "MONITORING",
+            "last_trade_at": datetime.now(),
+            "entry_price": trade_price,
+            "entry_qty": qty,
+            "entry_side": side,
+            "sl_price": sl_price,
+            "tp_price": tp_price,
+            "trade_instrument_key_actual": trade_instrument_key,
+        }
         await self.mongodb["strategy_deployments"].update_one(
             {"_id": dep["_id"]},
-            {"$set": {"status": "TRADED", "last_trade_at": datetime.now()}}
+            {"$set": update_fields}
         )
 
         # Telegram Notification
+        symbol_info = await self.get_symbol_info(trade_instrument_key)
+        option_info = await telegram_service.get_option_display_info(trade_instrument_key)
+        option_block = f"{option_info}" if option_info else ""
+        sl_info = f"\n<b>Stop Loss:</b> ₹{sl_price} ({stop_loss_pct}%)" if sl_price > 0 else ""
+        tp_info = f"\n<b>Take Profit:</b> ₹{tp_price} ({take_profit_pct}%)" if tp_price > 0 else ""
         msg = (
             f"🚀 <b>Trade Executed!</b>\n\n"
-            f"<b>Instrument:</b> {trade_instrument_key}\n"
+            f"<b>Instrument:</b> {symbol_info}\n"
+            f"<b>Key:</b> {trade_instrument_key}\n"
+            f"{option_block}"
             f"<b>Side:</b> {side}\n"
             f"<b>Quantity:</b> {qty}\n"
             f"<b>Price:</b> ₹{trade_price}\n"
-            f"<b>Mode:</b> {mode}\n"
+            f"<b>Mode:</b> {mode}"
+            f"{sl_info}{tp_info}\n"
+            f"<b>Status:</b> Now monitoring for SL/TP\n"
             f"<b>Time:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         )
         await telegram_service.send_message(msg)
+
+    async def monitor_position(self, dep):
+        """Monitor an open position for SL/TP hit."""
+        trade_ik = dep.get('trade_instrument_key_actual') or dep.get('trade_instrument_key') or dep.get('primary_instrument')
+        entry_price = dep.get('entry_price', 0)
+        sl_price = dep.get('sl_price', 0)
+        tp_price = dep.get('tp_price', 0)
+        direction = dep.get('trade_type', 'LONG')
+        mode = dep.get('deployment_mode', 'MOCK')
+        qty = dep.get('entry_qty', dep.get('quantity', 1))
+
+        if not trade_ik or entry_price <= 0:
+            return
+
+        # If both SL and TP are 0, nothing to monitor — mark as TRADED
+        if sl_price <= 0 and tp_price <= 0:
+            await self.mongodb["strategy_deployments"].update_one(
+                {"_id": dep["_id"]},
+                {"$set": {"status": "TRADED"}}
+            )
+            return
+
+        # Fetch live price
+        try:
+            quotes = upstox_service.get_market_quotes([trade_ik])
+            ltp = quotes.get(trade_ik, {}).get('ltp', 0)
+        except Exception as e:
+            print(f"Monitor: Failed to fetch LTP for {trade_ik}: {e}")
+            return
+
+        if ltp <= 0:
+            return
+
+        # Calculate unrealized P&L
+        if direction == 'LONG':
+            pnl = round((ltp - entry_price) * qty, 2)
+            profit_pct = ((ltp - entry_price) / entry_price) * 100 if entry_price > 0 else 0
+        else:
+            pnl = round((entry_price - ltp) * qty, 2)
+            profit_pct = ((entry_price - ltp) / entry_price) * 100 if entry_price > 0 else 0
+
+        # Trailing SL Logic: Move to Break-even
+        trailing_sl_enabled = dep.get('trailing_sl', False)
+        trailing_trigger = dep.get('trailing_sl_trigger_pct', 40.0)
+        sl_trailed = dep.get('sl_trailed', False)
+
+        if trailing_sl_enabled and not sl_trailed and profit_pct >= trailing_trigger:
+            print(f"Monitor: Profit reached {profit_pct:.2f}%, trailing SL to Break-even (₹{entry_price})")
+            sl_price = entry_price
+            await self.mongodb["strategy_deployments"].update_one(
+                {"_id": dep["_id"]},
+                {"$set": {
+                    "sl_price": sl_price,
+                    "sl_trailed": True,
+                    "sl_trailed_at": datetime.now()
+                }}
+            )
+            # Update local dep object so subsequent logic uses new sl_price
+            dep['sl_price'] = sl_price
+            dep['sl_trailed'] = True
+
+            # Notify via Telegram
+            symbol_info = await self.get_symbol_info(trade_ik)
+            option_info = await telegram_service.get_option_display_info(trade_ik)
+            option_block = f"{option_info}" if option_info else ""
+            msg = (
+                f"🛡️ <b>Trailing SL Activated!</b>\n\n"
+                f"<b>Instrument:</b> {symbol_info}\n"
+                f"<b>Key:</b> {trade_ik}\n"
+                f"{option_block}"
+                f"<b>Profit:</b> {profit_pct:.2f}%\n"
+                f"<b>New SL:</b> ₹{sl_price} (Break-even)\n"
+                f"<b>Time:</b> {datetime.now().strftime('%H:%M:%S')}"
+            )
+            try:
+                await telegram_service.send_message(msg)
+            except: pass
+
+        # Always update the deployment doc with latest LTP + P&L for UI display
+        await self.mongodb["strategy_deployments"].update_one(
+            {"_id": dep["_id"]},
+            {"$set": {
+                "live_ltp": ltp,
+                "live_pnl": pnl,
+                "ltp_updated_at": datetime.now()
+            }}
+        )
+
+        # Check SL/TP conditions
+        sl_hit = False
+        tp_hit = False
+        exit_reason = ""
+
+        if direction == 'LONG':
+            if sl_price > 0 and ltp <= sl_price:
+                sl_hit = True
+                exit_reason = "STOP_LOSS"
+            elif tp_price > 0 and ltp >= tp_price:
+                tp_hit = True
+                exit_reason = "TAKE_PROFIT"
+        else:  # SHORT
+            if sl_price > 0 and ltp >= sl_price:
+                sl_hit = True
+                exit_reason = "STOP_LOSS"
+            elif tp_price > 0 and ltp <= tp_price:
+                tp_hit = True
+                exit_reason = "TAKE_PROFIT"
+
+        if sl_hit or tp_hit:
+            # Execute exit trade
+            await self.execute_exit(dep, trade_ik, ltp, qty, exit_reason, pnl, mode)
+        else:
+            # Log monitoring check (throttled — only log every ~30s to avoid spam)
+            # Check last log timestamp for this deployment
+            last_log = await self.mongodb["deployment_logs"].find_one(
+                {"deployment_id": str(dep["_id"]), "type": "MONITOR"},
+                sort=[("timestamp", -1)]
+            )
+            should_log = True
+            if last_log and last_log.get('timestamp'):
+                elapsed = (datetime.now() - last_log['timestamp']).total_seconds()
+                should_log = elapsed >= 30  # Log every 30 seconds
+
+            if should_log:
+                await self.mongodb["deployment_logs"].insert_one({
+                    "deployment_id": str(dep["_id"]),
+                    "timestamp": datetime.now(),
+                    "type": "MONITOR",
+                    "instrument": trade_ik,
+                    "entry_price": entry_price,
+                    "ltp": ltp,
+                    "sl_price": sl_price,
+                    "tp_price": tp_price,
+                    "pnl": pnl,
+                    "signal": False,
+                    "traded": False,
+                    "rules": [
+                        {"rule": f"SL Check (₹{sl_price})", "matched": sl_hit, "left": ltp, "right": sl_price} if sl_price > 0 else None,
+                        {"rule": f"TP Check (₹{tp_price})", "matched": tp_hit, "left": ltp, "right": tp_price} if tp_price > 0 else None,
+                    ],
+                    "message": f"Monitoring: LTP=₹{ltp} | Entry=₹{entry_price} | P&L=₹{pnl} | SL=₹{sl_price} | TP=₹{tp_price}"
+                })
+
+    async def execute_exit(self, dep, trade_ik, exit_price, qty, reason, pnl, mode):
+        """Execute exit trade when SL or TP is hit."""
+        exit_side = "SELL" if dep.get('trade_type', 'LONG') == 'LONG' else "BUY"
+        entry_price = dep.get('entry_price', 0)
+
+        print(f"Engine: EXIT {exit_side} {qty} {trade_ik} at {exit_price} ({mode}) — {reason}")
+
+        try:
+            if mode == "MOCK":
+                # Find and exit the mock position
+                mock_trade = await self.mongodb["mock_trades"].find_one({
+                    "instrument_key": trade_ik,
+                    "status": "OPEN"
+                })
+                if mock_trade:
+                    await mock_trade_service.exit_position(mock_trade['trade_id'])
+                else:
+                    # Place a counter-order
+                    await mock_trade_service.place_order({
+                        "instrument_key": trade_ik,
+                        "quantity": qty,
+                        "transaction_type": exit_side,
+                        "price": exit_price
+                    })
+            else:
+                # LIVE exit via Upstox
+                await upstox_service.place_order(
+                    instrument_key=trade_ik,
+                    quantity=qty,
+                    transaction_type=exit_side,
+                    order_type="MARKET"
+                )
+        except Exception as e:
+            print(f"Engine: Exit order failed: {e}")
+
+        # Update deployment status
+        await self.mongodb["strategy_deployments"].update_one(
+            {"_id": dep["_id"]},
+            {"$set": {
+                "status": "EXITED",
+                "exit_price": exit_price,
+                "exit_reason": reason,
+                "exit_pnl": pnl,
+                "exited_at": datetime.now()
+            }}
+        )
+
+        # Log the exit event
+        await self.mongodb["deployment_logs"].insert_one({
+            "deployment_id": str(dep["_id"]),
+            "timestamp": datetime.now(),
+            "type": "EXIT",
+            "instrument": trade_ik,
+            "entry_price": entry_price,
+            "exit_price": exit_price,
+            "pnl": pnl,
+            "reason": reason,
+            "signal": True,
+            "traded": True,
+            "rules": [{"rule": reason, "matched": True, "left": exit_price, "right": dep.get('sl_price' if reason == 'STOP_LOSS' else 'tp_price', 0)}],
+            "message": f"{'🛑 STOP LOSS' if reason == 'STOP_LOSS' else '🎯 TAKE PROFIT'} HIT — Exited {exit_side} {qty} at ₹{exit_price} | P&L: ₹{pnl}"
+        })
+
+        # Telegram Notification
+        symbol_info = await self.get_symbol_info(trade_ik)
+        option_info = await telegram_service.get_option_display_info(trade_ik)
+        option_block = f"{option_info}" if option_info else ""
+        emoji = "🛑" if reason == "STOP_LOSS" else "🎯"
+        pnl_emoji = "🟢" if pnl >= 0 else "🔴"
+        msg = (
+            f"{emoji} <b>Position Closed — {reason.replace('_', ' ')}</b>\n\n"
+            f"<b>Instrument:</b> {symbol_info}\n"
+            f"<b>Key:</b> {trade_ik}\n"
+            f"{option_block}"
+            f"<b>Entry:</b> ₹{entry_price}\n"
+            f"<b>Exit:</b> ₹{exit_price}\n"
+            f"<b>Qty:</b> {qty}\n"
+            f"{pnl_emoji} <b>P&L:</b> ₹{pnl}\n"
+            f"<b>Mode:</b> {mode}\n"
+            f"<b>Time:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        try:
+            await telegram_service.send_message(msg)
+        except: pass
+
+    async def get_symbol_info(self, instrument_key):
+        """Helper to get a human readable symbol from instrument key"""
+        if not instrument_key:
+            return "Unknown"
+        
+        if instrument_key in self.symbol_cache:
+            return self.symbol_cache[instrument_key]
+        
+        if self.mongodb is not None:
+            try:
+                # Try scanner_instruments_main first (user selected ones)
+                instr = await self.mongodb["scanner_instruments_main"].find_one({"instrument_key": instrument_key})
+                if not instr:
+                    # Try upstox_collection (master list)
+                    instr = await self.mongodb["upstox_collection"].find_one({"instrument_key": instrument_key})
+                
+                if instr:
+                    symbol = instr.get('trading_symbol') or instr.get('name')
+                    name = instr.get('name')
+                    if symbol:
+                        if name and name.upper() != symbol.upper():
+                            display_name = f"{symbol} ({name})"
+                        else:
+                            display_name = symbol
+                        self.symbol_cache[instrument_key] = display_name
+                        return display_name
+            except Exception as e:
+                print(f"Error fetching symbol for {instrument_key}: {e}")
+        
+        # Fallback to key if symbol not found (strip key prefix if present with explanatory label)
+        if "|" in instrument_key:
+            parts = instrument_key.split("|")
+            exchange = parts[0]
+            token = parts[-1]
+            if "FO" in exchange:
+                return f"Expired/Unknown F&O ({token})"
+            elif "EQ" in exchange or exchange in ["NSE", "BSE"]:
+                return f"Expired/Unknown Equity ({token})"
+            return token
+            
+        return instrument_key
 
 trading_engine = TradingEngine()

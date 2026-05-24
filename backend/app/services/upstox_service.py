@@ -234,7 +234,7 @@ class UpstoxService:
                 
                 if response.status_code != 200:
                     print(f"Option Chain API Error: {response.text}")
-                    return []
+                    return { 'chain': [], 'totals': { 'ce': 0, 'pe': 0 } }
                     
                 data = response.json()
                 if 'data' in data:
@@ -568,6 +568,69 @@ class UpstoxService:
         }
         
         return indicators, indicators_series, pivot_data
+
+    async def _fetch_intraday_df(self, instrument_key: str, interval: str):
+        """
+        Fetch today's intraday candles using the Upstox intraday API.
+        This works reliably for F&O instruments where the historical API often returns no data.
+        v3 endpoint: /v3/historical-candle/intraday/{instrumentKey}/{unit}/{interval}
+        v2 endpoint: /v2/historical-candle/intraday/{instrumentKey}/{interval}
+        """
+        try:
+            from urllib.parse import quote
+            import pandas as pd
+            import httpx
+
+            encoded_key = quote(instrument_key)
+
+            # Map interval to v3 unit/interval or v2 interval
+            v3_map = {
+                "3minute": ("minutes", "3"),
+                "5minute": ("minutes", "5"),
+                "15minute": ("minutes", "15"),
+                "60minute": ("minutes", "60"),
+            }
+            v2_map = {
+                "1minute": "1minute",
+                "30minute": "30minute",
+            }
+
+            if interval in v3_map:
+                unit, intv = v3_map[interval]
+                url = f"https://api.upstox.com/v3/historical-candle/intraday/{encoded_key}/{unit}/{intv}"
+            elif interval in v2_map:
+                intv = v2_map[interval]
+                url = f"{self.base_url}/historical-candle/intraday/{encoded_key}/{intv}"
+            else:
+                # Fallback to 1minute v2
+                url = f"{self.base_url}/historical-candle/intraday/{encoded_key}/1minute"
+
+            headers = {"accept": "application/json"}
+            if self.access_token:
+                headers["Authorization"] = f"Bearer {self.access_token}"
+
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.get(url, headers=headers)
+                data = resp.json()
+
+            if data and data.get('status') == 'success' and data.get('data', {}).get('candles'):
+                candles = data['data']['candles']
+                df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'oi'])
+                df['timestamp'] = pd.to_datetime(df['timestamp'])
+                if df['timestamp'].dt.tz is not None:
+                    df['timestamp'] = df['timestamp'].dt.tz_localize(None)
+                df.set_index('timestamp', inplace=True)
+                df.sort_index(inplace=True)
+                for col in ['open', 'high', 'low', 'close', 'volume']:
+                    df[col] = pd.to_numeric(df[col])
+                return df
+            else:
+                print(f"Intraday API returned no data for {instrument_key}")
+                return pd.DataFrame()
+        except Exception as e:
+            print(f"Intraday fetch error for {instrument_key}: {e}")
+            return pd.DataFrame()
+
     async def _fetch_historical_df(self, instrument_key: str, interval: str, days_back_override: int = None):
         """
         Helper to fetch Historical Dataframe with Resampling logic.
@@ -649,7 +712,7 @@ class UpstoxService:
                  headers["Authorization"] = f"Bearer {self.access_token}"
             
             data = None
-            async with httpx.AsyncClient(timeout=30.0) as client:
+            async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.get(url, headers=headers)
                 data = resp.json()
             
@@ -753,13 +816,15 @@ class UpstoxService:
             print(f"Pivot Fetch Error: {e}")
             return None
 
-    async def get_incremental_candles(self, instrument_key: str, interval: str, db):
+    async def get_incremental_candles(self, instrument_key: str, interval: str, db, force: bool = False):
         try:
-            # 1. Load from DB
-            existing_doc = await db["instrument_candles"].find_one({"instrument_key": instrument_key, "interval": interval})
-            
+            # 1. Load from DB (Skip if force is true)
             existing_df = pd.DataFrame()
             last_timestamp = None
+            existing_doc = None
+            
+            if not force:
+                existing_doc = await db["instrument_candles"].find_one({"instrument_key": instrument_key, "interval": interval})
             
             if existing_doc and "candles" in existing_doc:
                 existing_df = pd.DataFrame(existing_doc["candles"])
@@ -785,7 +850,11 @@ class UpstoxService:
             # If we have too few candles, force a full re-fetch to ensure we have enough lookback
             # Increased to 300 to ensure we have a valid buffer for SMA 200 calculation
             if len(existing_df) < 300:
-                print(f"Insufficient history ({len(existing_df)} < 300) for {instrument_key}. Forcing full fetch.")
+                if len(existing_df) == 0:
+                    # print(f"Empty cache for {instrument_key}. Initial history fetch...") # Reduced verbosity
+                    pass
+                else:
+                    print(f"Insufficient history ({len(existing_df)} < 300) for {instrument_key}. Forcing full fetch.")
                 last_timestamp = None
                 existing_df = pd.DataFrame() # Discard and re-fetch full
             
@@ -840,6 +909,17 @@ class UpstoxService:
                     }},
                     upsert=True
                 )
+            else:
+                # Still update last_updated so we don't re-fetch immediately if it's genuinely empty on Upstox
+                await db["instrument_candles"].update_one(
+                    {"instrument_key": instrument_key, "interval": interval},
+                    {"$set": {
+                        "instrument_key": instrument_key,
+                        "interval": interval,
+                        "last_updated": datetime.datetime.now(),
+                    }},
+                    upsert=True
+                )
             
             return final_df
 
@@ -872,7 +952,21 @@ class UpstoxService:
         except Exception as e:
             print(f"Error saving candles: {e}")
 
-    async def process_instrument_full(self, instrument_key: str, interval: str, db, mode: str = "combined"):
+    async def process_instrument_full(self, instrument_key: str, interval: str, db, mode: str = "combined", force: bool = False):
+        """
+        Orchestration with Fallback: Try NSE, then fallback to BSE if NSE fails.
+        """
+        res = await self._process_instrument_core(instrument_key, interval, db, mode, force=force)
+        
+        # Fallback Logic: If NSE fails, try BSE equivalent
+        if res is None and instrument_key.startswith("NSE_EQ|"):
+            bse_key = instrument_key.replace("NSE_EQ|", "BSE_EQ|")
+            print(f"🔄 FALLBACK: NSE failed for {instrument_key}. Trying BSE equivalent: {bse_key}")
+            res = await self._process_instrument_core(bse_key, interval, db, mode, force=force)
+            
+        return res
+
+    async def _process_instrument_core(self, instrument_key: str, interval: str, db, mode: str = "combined", force: bool = False):
         """
         Full orchestration: Incremental History + Intraday + Calc + Persist
         Mode: 'combined', 'history', 'intraday'
@@ -881,7 +975,7 @@ class UpstoxService:
             full_df = pd.DataFrame()
             
             # 1. History - ALWAYS fetch for SMA 50/200 lookback regardless of mode
-            history_df = await self.get_incremental_candles(instrument_key, interval, db)
+            history_df = await self.get_incremental_candles(instrument_key, interval, db, force=force)
             if history_df is not None and not history_df.empty:
                 # Ensure naive
                 if history_df.index.tz is not None:
@@ -923,8 +1017,32 @@ class UpstoxService:
             # 3. Persist (Save what we have, useful for cache)
             await self.save_candles(db, instrument_key, interval, full_df)
 
-            # 4. Fetch Pivots (Required for indicators)
-            pivots = await self._fetch_daily_pivot_data_async(instrument_key)
+            # 4. Fetch Daily History (Used for both Pivots and Multi-Day changes)
+            # Fetch once (45 days) to reuse
+            daily_df = await self._fetch_historical_df(instrument_key, "day", days_back_override=45)
+            
+            pivots = None
+            if daily_df is not None and not daily_df.empty:
+                 # Extract pivot data from the same daily_df
+                 import datetime
+                 today_ts = pd.Timestamp(datetime.date.today())
+                 if daily_df.index.tz is not None:
+                     daily_df.index = daily_df.index.tz_localize(None)
+                 closed_days = daily_df[daily_df.index < today_ts]
+                 if len(closed_days) > 0:
+                     yesterday = closed_days.iloc[-1]
+                     yp_high, yp_low, yp_close = float(yesterday['high']), float(yesterday['low']), float(yesterday['close'])
+                     pivot = (yp_high + yp_low + yp_close) / 3
+                     pivots = {
+                         'pivot': round(pivot, 2),
+                         'r1': round((2 * pivot) - yp_low, 2),
+                         's1': round((2 * pivot) - yp_high, 2),
+                         'r2': round(pivot + (yp_high - yp_low), 2),
+                         's2': round(pivot - (yp_high - yp_low), 2),
+                         'r3': round(yp_high + 2 * (pivot - yp_low), 2),
+                         's3': round(yp_low - 2 * (yp_high - pivot), 2),
+                         'prev_close': round(yp_close, 2)
+                     }
 
             # 5. Calculate Indicators
             limit_candles = 500
@@ -970,14 +1088,13 @@ class UpstoxService:
                 print(f"Market Quote fetch failed for {instrument_key}: {e}")
                 if prev_close > 0:
                     real_change = real_ltp - prev_close
-            # 5c. Multi-Day Change Calculation
+            # 5c. Multi-Day Change Calculation (REUSE daily_df)
             daily_changes = []  # [{day: "D-1", pct: 1.23, close: 1234.5}, ...]
             change_7d = None
             change_30d = None
             close_7d = None
             close_30d = None
             try:
-                daily_df = await self._fetch_historical_df(instrument_key, "day", days_back_override=45)
                 if daily_df is not None and not daily_df.empty:
                     daily_closes = daily_df['close'].dropna()
                     n = len(daily_closes)
@@ -1029,9 +1146,8 @@ class UpstoxService:
             }
             
             # --- PERSISTENCE FOR UI LOAD ---
-            # Save the result to a separate collection so we can load it instantly on startup
             try:
-                await db["scanner_latest_results"].update_one(
+                await db["scanner_results"].update_one(
                     {"instrument_key": instrument_key},
                     {"$set": result},
                     upsert=True
@@ -1569,9 +1685,14 @@ class UpstoxService:
             # Telegram Notification
             try:
                 from .telegram_service import telegram_service
+                resolved_symbol = await telegram_service.get_symbol_info(instrument_key)
+                option_info = await telegram_service.get_option_display_info(instrument_key)
+                option_block = f"{option_info}" if option_info else ""
                 msg = (
                     f"📝 <b>Order Placed (Upstox)</b>\n\n"
-                    f"<b>Instrument:</b> {instrument_key}\n"
+                    f"<b>Instrument:</b> {resolved_symbol}\n"
+                    f"<b>Key:</b> {instrument_key}\n"
+                    f"{option_block}"
                     f"<b>Side:</b> {transaction_type}\n"
                     f"<b>Qty:</b> {quantity}\n"
                     f"<b>Type:</b> {order_type}\n"
@@ -1783,9 +1904,14 @@ class UpstoxService:
             # Telegram Notification
             try:
                 from .telegram_service import telegram_service
+                resolved_symbol = await telegram_service.get_symbol_info(target_pos.instrument_token)
+                option_info = await telegram_service.get_option_display_info(target_pos.instrument_token)
+                option_block = f"{option_info}" if option_info else ""
                 msg = (
                     f"🎯 <b>Position Squared Off (Upstox)</b>\n\n"
-                    f"<b>Instrument:</b> {target_pos.trading_symbol}\n"
+                    f"<b>Instrument:</b> {resolved_symbol}\n"
+                    f"<b>Key:</b> {target_pos.instrument_token}\n"
+                    f"{option_block}"
                     f"<b>Qty:</b> {abs_qty}\n"
                     f"<b>Exit Price:</b> ₹{price}"
                 )

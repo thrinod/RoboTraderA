@@ -60,9 +60,17 @@ class MockTradeService:
             # Telegram Notification
             try:
                 from .telegram_service import telegram_service
+                resolved_symbol = await telegram_service.get_symbol_info(order_details['instrument_key'])
+                option_info = await telegram_service.get_option_display_info(
+                    order_details['instrument_key'], 
+                    order_details.get('trading_symbol')
+                )
+                option_block = f"{option_info}" if option_info else ""
                 msg = (
                     f"📝 <b>Mock Order Placed</b>\n\n"
-                    f"<b>Instrument:</b> {quote.get('name') or order_details['instrument_key']}\n"
+                    f"<b>Instrument:</b> {resolved_symbol}\n"
+                    f"<b>Key:</b> {order_details['instrument_key']}\n"
+                    f"{option_block}"
                     f"<b>Side:</b> {order_details['transaction_type']}\n"
                     f"<b>Qty:</b> {int(order_details['quantity'])}\n"
                     f"<b>Price:</b> ₹{avg_price}"
@@ -173,9 +181,17 @@ class MockTradeService:
             # Telegram Notification
             try:
                 from .telegram_service import telegram_service
+                resolved_symbol = await telegram_service.get_symbol_info(trade['instrument_key'])
+                option_info = await telegram_service.get_option_display_info(
+                    trade['instrument_key'], 
+                    trade.get('trading_symbol')
+                )
+                option_block = f"{option_info}" if option_info else ""
                 msg = (
                     f"🎯 <b>Mock Position Closed</b>\n\n"
-                    f"<b>Instrument:</b> {trade['trading_symbol']}\n"
+                    f"<b>Instrument:</b> {resolved_symbol}\n"
+                    f"<b>Key:</b> {trade['instrument_key']}\n"
+                    f"{option_block}"
                     f"<b>Qty:</b> {qty}\n"
                     f"<b>Exit Price:</b> ₹{exit_price}\n"
                     f"<b>Final P&L:</b> ₹{round(pnl, 2)}"

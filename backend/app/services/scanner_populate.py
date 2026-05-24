@@ -67,6 +67,8 @@ class ScannerPopulateService:
         
         # Clear existing for "Load Only" behavior
         await self.db["scanner_instruments_main"].delete_many({})
+        
+        operations = []
 
         for symbol in stock_list:
             # Search specifically in NSE_EQ
@@ -87,26 +89,40 @@ class ScannerPopulateService:
         async def fetch_and_prepare(sym):
             async with semaphore:
                 try:
-                    # Search for "symbol" in NSE_EQ
-                    res = await self.upstox.search_instruments(sym, segment="NSE_EQ")
-                    # Find exact match
+                    # Search for "symbol" in NSE_EQ within our local master list collection
+                    cursor = self.db["upstox_collection"].find({
+                        "trading_symbol": sym,
+                        "exchange": {"$in": ["NSE_EQ", "NSE", "BSE_EQ", "BSE"]}
+                    })
+                    res = await cursor.to_list(length=10)
+                    
+                    # Find exact match or best match
                     match = None
                     if res:
+                        # Prioritize NSE
+                        res.sort(key=lambda x: 1 if x.get('exchange') in ['NSE_EQ', 'NSE'] else 2)
+                        # Try exact trading_symbol match first
                         for item in res:
-                            if item['trading_symbol'] == sym and item['exchange'] == 'NSE':
+                            if item['trading_symbol'] == sym:
                                 match = item
                                 break
-                        # If no exact match, take first
-                        if not match and res:
+                        # Fallback to name match if symbol didn't match exactly
+                        if not match:
+                            for item in res:
+                                if item.get('name') == sym:
+                                    match = item
+                                    break
+                        # Last fallback: take first result
+                        if not match:
                             match = res[0]
                     
                     if match:
                         return {
-                            "instrument_key": match['instrument_key'],
-                            "name": match['name'],
-                            "exchange": match['exchange'],
+                            "instrument_key": match.get('instrument_key'),
+                            "name": match.get('name'),
+                            "exchange": match.get('exchange'),
                             "segment": match.get('segment', 'NSE_EQ'),
-                            "trading_symbol": match['trading_symbol'],
+                            "trading_symbol": match.get('trading_symbol'),
                             "mtf_enabled": False, # Default
                             "added_at": datetime.datetime.now().isoformat()
                         }
@@ -133,6 +149,103 @@ class ScannerPopulateService:
             return {"status": "success", "message": f"Added {len(operations)} instruments to Scanner Main"}
         
         return {"status": "warning", "message": "No instruments found to add"}
+    async def populate_all_stocks(self):
+        """
+        Populate scanner with all stocks using a high-performance MongoDB Aggregation Pipeline.
+        This performs matching and insertion directly in the DB.
+        """
+        try:
+            import datetime
+            added_at = datetime.datetime.now().isoformat()
+            
+            # Use MongoDB Aggregation for maximum speed
+            # 1. Match SYMBOL (from scanner_instruments) with trading_symbol (from upstox_collection)
+            # 2. Project fields into the correct format
+            # 3. Use $out to replace 'scanner_instruments_main' atomically
+            
+            pipeline = [
+                {
+                    "$lookup": {
+                        "from": "upstox_collection",
+                        "localField": "SYMBOL",
+                        "foreignField": "trading_symbol",
+                        "as": "master_data"
+                    }
+                },
+                {"$unwind": "$master_data"},
+                {
+                    "$match": {
+                        "master_data.exchange": {"$in": ["NSE_EQ", "NSE", "BSE_EQ", "BSE"]},
+                        "master_data.instrument_key": {"$ne": None}
+                    }
+                },
+                {
+                    "$addFields": {
+                        "priority": {
+                            "$cond": [
+                                {"$in": ["$master_data.exchange", ["NSE_EQ", "NSE"]]},
+                                1,
+                                2
+                            ]
+                        }
+                    }
+                },
+                {"$sort": {"SYMBOL": 1, "priority": 1}},
+                {
+                    "$group": {
+                        "_id": "$SYMBOL",
+                        "instrument_key": {"$first": "$master_data.instrument_key"},
+                        "name": {"$first": {"$ifNull": ["$master_data.name", "$name"]}},
+                        "exchange": {"$first": {"$ifNull": ["$master_data.exchange", "$exchange"]}},
+                        "segment": {"$first": {"$ifNull": ["$master_data.segment", "$segment"]}},
+                        "trading_symbol": {"$first": "$master_data.trading_symbol"},
+                        "mtf_enabled": {"$first": {"$literal": False}},
+                        "added_at": {"$first": {"$literal": added_at}}
+                    }
+                },
+                # Extra safety: Ensure unique instrument_key if multiple SYMBOLs map to same key (unlikely but possible)
+                {
+                    "$group": {
+                        "_id": "$instrument_key",
+                        "name": {"$first": "$name"},
+                        "exchange": {"$first": "$exchange"},
+                        "segment": {"$first": "$segment"},
+                        "trading_symbol": {"$first": "$trading_symbol"},
+                        "mtf_enabled": {"$first": "$mtf_enabled"},
+                        "added_at": {"$first": "$added_at"}
+                    }
+                },
+                {
+                    "$project": {
+                        "_id": 0,
+                        "instrument_key": "$_id",
+                        "name": 1,
+                        "exchange": 1,
+                        "segment": 1,
+                        "trading_symbol": 1,
+                        "mtf_enabled": 1,
+                        "added_at": 1
+                    }
+                },
+                {
+                    "$out": "scanner_instruments_main"
+                }
+            ]
+            
+            print("Running high-speed aggregation population...")
+            await self.db["scanner_instruments"].aggregate(pipeline).to_list(length=1)
+            
+            # Check result count
+            count = await self.db["scanner_instruments_main"].count_documents({})
+            
+            print(f"Aggregation Load Complete: {count} stocks processed.")
+            return {"status": "success", "message": f"Successfully loaded {count} stocks using high-speed pipeline."}
+            
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f"Error in high-speed population: {e}")
+            return {"status": "error", "message": f"Aggregation Error: {str(e)}"}
 
 
     async def populate_from_fno(self):
@@ -162,7 +275,7 @@ class ScannerPopulateService:
 
             # 2. Match with Upstox Collection (NSE_EQ)
             # Auto-fetch master instruments if collection is empty or has only dummy data
-            eq_count = await self.db["upstox_collection"].count_documents({"exchange": {"$in": ["NSE_EQ", "NSE"]}})
+            eq_count = await self.db["upstox_collection"].count_documents({"exchange": {"$in": ["NSE_EQ", "NSE", "BSE_EQ", "BSE"]}})
             if eq_count < 1000:
                 print("upstox_collection is empty or partial! Auto-fetching master instruments...")
                 await self.fetch_master_instruments()
@@ -170,7 +283,7 @@ class ScannerPopulateService:
             # Fetch all possible NSE Equity instruments
             # We fetch more fields to help with matching
             all_eq_cursor = self.db["upstox_collection"].find(
-                {"exchange": {"$in": ["NSE_EQ", "NSE"]}},
+                {"exchange": {"$in": ["NSE_EQ", "NSE", "BSE_EQ", "BSE"]}},
                 {"trading_symbol": 1, "instrument_key": 1, "name": 1, "instrument_type": 1, "exchange": 1}
             )
             all_eq_docs = await all_eq_cursor.to_list(length=50000)
@@ -192,8 +305,8 @@ class ScannerPopulateService:
                 # Normalize symbol: RELIANCE-EQ -> RELIANCE
                 clean_ts = ts.replace("-EQ", "").strip()
                 
-                # If there are duplicates, prioritize NSE_EQ exchange
-                if clean_ts not in upstox_map or doc.get('exchange') == 'NSE_EQ':
+                # Priority logic: prioritize NSE_EQ exchange
+                if clean_ts not in upstox_map or doc.get('exchange') in ['NSE_EQ', 'NSE']:
                     upstox_map[clean_ts] = doc
 
             matches = []
