@@ -144,8 +144,14 @@ class TelegramService:
                 match = re.search(r'(\d+)(?:CE|PE)$', symbol)
                 strike = match.group(1) if match else "Unknown"
                 
-                opt_name = "Call Option (CE)" if opt_type == "CE" else "Put Option (PE)"
+                # Also try to extract a clean name prefix from the symbol
+                # E.g. "NATIONALUM26FEB355PE" -> "NATIONALUM"
+                name_match = re.search(r'^([A-Z]+)\d{2}[A-Z]{3}', symbol)
+                name = name_match.group(1) if name_match else symbol
+                
+                opt_name = "Call (CE)" if opt_type == "CE" else "Put (PE)"
                 return (
+                    f"<b>Name:</b> {name}\n"
                     f"<b>Option Type:</b> {opt_name}\n"
                     f"<b>Strike Price:</b> ₹{strike}\n"
                 )
@@ -154,10 +160,14 @@ class TelegramService:
         opt_type = details.get("option_type")
         strike = details.get("strike")
         expiry = details.get("expiry")
+        name = details.get("name")
         
         opt_name = "Call (CE)" if opt_type == "CE" else "Put (PE)"
         
-        info = f"<b>Option Type:</b> {opt_name}\n"
+        info = ""
+        if name:
+            info += f"<b>Name:</b> {name}\n"
+        info += f"<b>Option Type:</b> {opt_name}\n"
         if strike is not None:
             try:
                 strike_float = float(strike)

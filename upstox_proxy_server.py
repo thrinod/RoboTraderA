@@ -10,12 +10,18 @@ app = FastAPI(title="Upstox Proxy Server")
 
 UPSTOX_BASE_URL = "https://api.upstox.com"
 
-# Reusable client to keep connections alive
-client = httpx.AsyncClient(base_url=UPSTOX_BASE_URL, timeout=30.0)
+# Reusable client to keep connections alive, forcing IPv4 via binding to 0.0.0.0
+transport = httpx.AsyncHTTPTransport(local_address="0.0.0.0")
+client = httpx.AsyncClient(base_url=UPSTOX_BASE_URL, timeout=30.0, transport=transport)
 
 @app.on_event("shutdown")
 async def shutdown():
     await client.aclose()
+
+@app.get("/")
+async def ping():
+    """Health check endpoint to verify proxy status."""
+    return {"status": "active", "message": "Upstox Proxy Server is running"}
 
 @app.get("/check-ip")
 async def check_proxy_ip():

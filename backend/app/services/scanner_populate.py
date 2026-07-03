@@ -227,17 +227,20 @@ class ScannerPopulateService:
                         "added_at": 1
                     }
                 },
-                {
-                    "$out": "scanner_instruments_main"
-                }
             ]
             
             print("Running high-speed aggregation population...")
-            await self.db["scanner_instruments"].aggregate(pipeline).to_list(length=1)
+            cursor = self.db["scanner_instruments"].aggregate(pipeline)
+            docs = await cursor.to_list(length=10000)
             
-            # Check result count
-            count = await self.db["scanner_instruments_main"].count_documents({})
+            # Clear target collection cleanly
+            await self.db["scanner_instruments_all"].delete_many({})
             
+            # Insert new documents in bulk
+            if docs:
+                await self.db["scanner_instruments_all"].insert_many(docs)
+            
+            count = len(docs)
             print(f"Aggregation Load Complete: {count} stocks processed.")
             return {"status": "success", "message": f"Successfully loaded {count} stocks using high-speed pipeline."}
             
@@ -375,7 +378,7 @@ class ScannerPopulateService:
             
             # Clear existing? Or just add?
             # User request: "load only these instrument". So we should Clear first.
-            await self.db["scanner_instruments_main"].delete_many({})
+            await self.db["scanner_instruments_fno"].delete_many({})
             
             timestamp = datetime.datetime.now().isoformat()
             
@@ -413,7 +416,7 @@ class ScannerPopulateService:
                 )
 
             if operations:
-                await self.db["scanner_instruments_main"].bulk_write(operations)
+                await self.db["scanner_instruments_fno"].bulk_write(operations)
             
             total_count = len(matches) + len(index_matches)
             return {

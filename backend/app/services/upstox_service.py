@@ -259,6 +259,7 @@ class UpstoxService:
                             oi = md.get('oi', 0)
                             close = md.get('close_price', 0)
                             change = round(ltp - close, 2) if close > 0 else 0
+                            pchange = round((change / close) * 100, 2) if close > 0 else 0.0
                             delta = greeks.get('delta', 0)
                             oi_value = oi * ltp
                             
@@ -272,6 +273,7 @@ class UpstoxService:
                                 'open_interest': oi,
                                 'volume': md.get('volume', 0),
                                 'price_change': change,
+                                'pchange': pchange,
                                 'bid_price': md.get('bid_price', 0),
                                 'ask_price': md.get('ask_price', 0),
                                 'low_price': md.get('low_price', 0),
@@ -292,6 +294,7 @@ class UpstoxService:
                             oi = md.get('oi', 0)
                             close = md.get('close_price', 0)
                             change = round(ltp - close, 2) if close > 0 else 0
+                            pchange = round((change / close) * 100, 2) if close > 0 else 0.0
                             delta = greeks.get('delta', 0)
                             oi_value = oi * ltp
                             
@@ -305,6 +308,7 @@ class UpstoxService:
                                 'open_interest': oi,
                                 'volume': md.get('volume', 0),
                                 'price_change': change,
+                                'pchange': pchange,
                                 'bid_price': md.get('bid_price', 0),
                                 'ask_price': md.get('ask_price', 0),
                                 'low_price': md.get('low_price', 0),
@@ -1017,17 +1021,26 @@ class UpstoxService:
             # 3. Persist (Save what we have, useful for cache)
             await self.save_candles(db, instrument_key, interval, full_df)
 
-            # 4. Fetch Daily History (Used for both Pivots and Multi-Day changes)
-            # Fetch once (45 days) to reuse
-            daily_df = await self._fetch_historical_df(instrument_key, "day", days_back_override=45)
+            # 4. Fetch Daily History (Used for Pivots, Multi-Day changes, and 52-week High/Low)
+            # Fetch 375 days to have a full calendar year of data (365 days + buffer)
+            daily_df = await self._fetch_historical_df(instrument_key, "day", days_back_override=375)
             
             pivots = None
+            high_52w = None
+            low_52w = None
             if daily_df is not None and not daily_df.empty:
-                 # Extract pivot data from the same daily_df
+                 # Calculate 52-week High and Low from last 365 calendar days
                  import datetime
-                 today_ts = pd.Timestamp(datetime.date.today())
+                 one_year_ago = pd.Timestamp(datetime.date.today() - datetime.timedelta(days=365))
                  if daily_df.index.tz is not None:
                      daily_df.index = daily_df.index.tz_localize(None)
+                 last_year_df = daily_df[daily_df.index >= one_year_ago]
+                 if not last_year_df.empty:
+                     high_52w = round(float(last_year_df['high'].max()), 2)
+                     low_52w = round(float(last_year_df['low'].min()), 2)
+
+                 # Extract pivot data from the same daily_df
+                 today_ts = pd.Timestamp(datetime.date.today())
                  closed_days = daily_df[daily_df.index < today_ts]
                  if len(closed_days) > 0:
                      yesterday = closed_days.iloc[-1]
@@ -1069,6 +1082,7 @@ class UpstoxService:
             real_ltp = float(display_df.iloc[-1]["close"])  # fallback to last candle close
             prev_close = float(pivots.get('prev_close', 0)) if pivots else 0
             real_change = 0.0
+            real_volume = 0
 
             try:
                 quotes = self.get_market_quotes([instrument_key])
@@ -1080,6 +1094,8 @@ class UpstoxService:
                         real_change = float(q["change"])
                     elif prev_close > 0:
                         real_change = real_ltp - prev_close
+                    if q.get("volume"):
+                        real_volume = int(q["volume"])
                 else:
                     # Quote API returned but key not found, use pivot-based calc
                     if prev_close > 0:
@@ -1088,7 +1104,7 @@ class UpstoxService:
                 print(f"Market Quote fetch failed for {instrument_key}: {e}")
                 if prev_close > 0:
                     real_change = real_ltp - prev_close
-            # 5c. Multi-Day Change Calculation (REUSE daily_df)
+            # 5c. Multi-Day Change Calculation (REUSE daily_df with robust alignment)
             daily_changes = []  # [{day: "D-1", pct: 1.23, close: 1234.5}, ...]
             change_7d = None
             change_30d = None
@@ -1097,17 +1113,27 @@ class UpstoxService:
             try:
                 if daily_df is not None and not daily_df.empty:
                     daily_closes = daily_df['close'].dropna()
-                    n = len(daily_closes)
-                    ref_price = real_ltp if real_ltp > 0 else (float(daily_closes.iloc[-1]) if n > 0 else 0)
+                    
+                    # Filter daily_closes to exclude today's candle to get only completed historical days
+                    import datetime
+                    today_str = datetime.date.today().strftime('%Y-%m-%d')
+                    historical_closes = daily_closes[daily_closes.index.strftime('%Y-%m-%d') != today_str]
+                    
+                    closes_list = [float(c) for c in historical_closes]
+                    
+                    # Always append today's live LTP as the latest day (closes_list[-1])
+                    if real_ltp > 0:
+                        closes_list.append(float(real_ltp))
+                    elif len(daily_closes) > 0:
+                        closes_list.append(float(daily_closes.iloc[-1]))
+                        
+                    m = len(closes_list)
 
-                    # Per-day changes: Day -1 through Day -5
+                    # Per-day changes: Day -1 through Day -5 representing CLOSED sessions
                     for i in range(1, 6):
-                        if n >= i + 1:
-                            if i == 1:
-                                today_price = ref_price
-                            else:
-                                today_price = float(daily_closes.iloc[-i])
-                            prev_price = float(daily_closes.iloc[-(i + 1)])
+                        if m >= i + 2:
+                            today_price = closes_list[-(i + 1)]
+                            prev_price = closes_list[-(i + 2)]
                             if prev_price > 0:
                                 pct = round(((today_price - prev_price) / prev_price) * 100, 2)
                             else:
@@ -1116,18 +1142,50 @@ class UpstoxService:
                         else:
                             daily_changes.append({"day": f"D-{i}", "pct": None, "close": None})
 
-                    # 7D and 30D cumulative
-                    if n >= 8:
-                        close_7d = round(float(daily_closes.iloc[-8]), 2)
-                        if close_7d > 0:
-                            change_7d = round(((ref_price - close_7d) / close_7d) * 100, 2)
-
-                    if n >= 23:
-                        close_30d = round(float(daily_closes.iloc[-23]), 2)
-                        if close_30d > 0:
-                            change_30d = round(((ref_price - close_30d) / close_30d) * 100, 2)
+                    # 7D and 30D cumulative changes using exact calendar lookbacks
+                    import datetime
+                    today_date = datetime.date.today()
+                    
+                    if daily_df.index.tz is not None:
+                        daily_df.index = daily_df.index.tz_localize(None)
+                        
+                    target_7d = pd.Timestamp(today_date - datetime.timedelta(days=7))
+                    target_30d = pd.Timestamp(today_date - datetime.timedelta(days=30))
+                    
+                    if len(closes_list) > 0:
+                        today_val = closes_list[-1]
+                        
+                        past_7d = daily_df[daily_df.index <= target_7d]
+                        if not past_7d.empty:
+                            close_7d = round(float(past_7d['close'].iloc[-1]), 2)
+                            if close_7d > 0:
+                                change_7d = round(((today_val - close_7d) / close_7d) * 100, 2)
+                                
+                        past_30d = daily_df[daily_df.index <= target_30d]
+                        if not past_30d.empty:
+                            close_30d = round(float(past_30d['close'].iloc[-1]), 2)
+                            if close_30d > 0:
+                                change_30d = round(((today_val - close_30d) / close_30d) * 100, 2)
             except Exception as e:
                 print(f"Multi-day change calc error for {instrument_key}: {e}")
+
+            # 5d. Volume Surge Calculation (Today's Volume / 20-day Avg Volume)
+            vol_surge = None
+            avg_volume_20d = None
+            try:
+                if daily_df is not None and not daily_df.empty and 'volume' in daily_df.columns:
+                    import datetime
+                    today_str = datetime.date.today().strftime('%Y-%m-%d')
+                    hist_vol = daily_df[daily_df.index.strftime('%Y-%m-%d') != today_str]['volume'].dropna()
+                    if len(hist_vol) >= 20:
+                        avg_volume_20d = round(float(hist_vol.tail(20).mean()), 0)
+                    elif len(hist_vol) >= 5:
+                        avg_volume_20d = round(float(hist_vol.mean()), 0)
+                    
+                    if avg_volume_20d and avg_volume_20d > 0 and real_volume > 0:
+                        vol_surge = round(real_volume / avg_volume_20d, 2)
+            except Exception as e:
+                print(f"Volume surge calc error for {instrument_key}: {e}")
 
             result = {
                 "instrument_key": instrument_key,
@@ -1142,6 +1200,11 @@ class UpstoxService:
                 "change_30d": change_30d,
                 "close_7d": close_7d,
                 "close_30d": close_30d,
+                "high_52w": high_52w,
+                "low_52w": low_52w,
+                "volume": real_volume,
+                "avg_volume_20d": int(avg_volume_20d) if avg_volume_20d else None,
+                "vol_surge": vol_surge,
                 "updated_at": datetime.datetime.now().isoformat()
             }
             
@@ -2048,6 +2111,8 @@ class UpstoxService:
                     if close > 0:
                         change_percent = (change / close) * 100
                     
+                    volume = get_val(quote, 'volume', 0)
+                    
                     quote_data = {
                         "ltp": ltp,
                         "close": close,
@@ -2055,7 +2120,8 @@ class UpstoxService:
                         "high": high,
                         "low": low,
                         "change": round(change, 2),
-                        "change_percent": round(change_percent, 2)
+                        "change_percent": round(change_percent, 2),
+                        "volume": int(volume) if volume else 0
                     }
                     
                     # 1. Primary Key Normalization (Colon -> Pipe)
